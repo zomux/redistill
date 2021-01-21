@@ -11,8 +11,10 @@ Train a new model on one or across multiple GPUs.
 
 import collections
 import math
+import sys
 import os
 import random
+import numpy as np
 
 import torch
 
@@ -20,9 +22,11 @@ from fairseq import checkpoint_utils, distributed_utils, options, progress_bar, 
 from fairseq.data import iterators
 from fairseq.trainer import Trainer
 from fairseq.meters import AverageMeter, StopwatchMeter
+import nsml
+from nsml import DATASET_PATH
 
 
-def main(args, init_distributed=False):
+def main(args, init_distributed=False, progressive_training_step=None):
     utils.import_user_module(args)
 
     assert args.max_tokens is not None or args.max_sentences is not None, \
@@ -55,6 +59,38 @@ def main(args, init_distributed=False):
         sum(p.numel() for p in model.parameters() if p.requires_grad),
     ))
 
+    # Load pre-trained model
+    data_token = args.data[0].split("/")[-1]
+    pretrained_path = "{}/train/pretrained_models/maskPredict_{}/checkpoint_best.pt".format(DATASET_PATH, data_token.split(".")[-1].replace("-", "_"))
+    print("| loading", pretrained_path)
+    state = checkpoint_utils.load_checkpoint_to_cpu(pretrained_path)
+    model.load_state_dict(state["model"], strict=True)
+    baseline_model = task.build_model(args)
+    baseline_model.load_state_dict(state["model"], strict=True)
+    if torch.cuda.is_available():
+        baseline_model.cuda()
+    task.set_baseline_model(baseline_model)
+
+    if not args.masking:
+        def nsml_bind(model):
+            def save(dir_path):
+                state = {
+                    'model': model.state_dict(),
+                }
+                torch.save(state, os.path.join(dir_path, 'best.pt'))
+
+            def load(dir_path):
+                state = torch.load(os.path.join(dir_path, 'best.pt'))
+                model.load_state_dict(state['model'], strict=False)
+                print('model loaded!')
+            nsml.bind(save=save, load=load)
+        nsml_bind(model)
+
+    if args.load:
+        print("loading model from session", args.load)
+        session = args.load.replace("nsml://", "")
+        nsml.load("best", session=session)
+
     # Build trainer
     trainer = Trainer(args, task, model, criterion)
     print('| training on {} GPUs'.format(args.distributed_world_size))
@@ -75,12 +111,17 @@ def main(args, init_distributed=False):
     train_meter.start()
     valid_losses = [None]
     valid_subsets = args.valid_subset.split(',')
+    if hasattr(args, "progressive") and args.progressive:
+        for i in range(args.refinetot):
+            print("validating for refine step", i)
+            validate(args, trainer, task, epoch_itr, valid_subsets, force_refine_step=i)
+        print("---")
+    validate(args, trainer, task, epoch_itr, valid_subsets)
     while lr > args.min_lr and epoch_itr.epoch < max_epoch and trainer.get_num_updates() < max_update:
         # train for one epoch
-        train(args, trainer, task, epoch_itr)
-
+        train(args, trainer, task, epoch_itr, force_refine_step=progressive_training_step)
         if not args.disable_validation and epoch_itr.epoch % args.validate_interval == 0:
-            valid_losses = validate(args, trainer, task, epoch_itr, valid_subsets)
+            valid_losses = validate(args, trainer, task, epoch_itr, valid_subsets, force_refine_step=progressive_training_step)
         else:
             valid_losses = [None]
 
@@ -98,9 +139,12 @@ def main(args, init_distributed=False):
     print('| done training in {:.1f} seconds'.format(train_meter.sum))
 
 
-def train(args, trainer, task, epoch_itr):
+def train(args, trainer, task, epoch_itr, force_refine_step=None):
     """Train the model for one epoch."""
     # Update parameters every N batches
+    def is_better(a, b):
+        return a > b if args.maximize_best_checkpoint_metric else a < b
+
     update_freq = args.update_freq[epoch_itr.epoch - 1] \
         if epoch_itr.epoch <= len(args.update_freq) else args.update_freq[-1]
 
@@ -117,11 +161,19 @@ def train(args, trainer, task, epoch_itr):
     extra_meters = collections.defaultdict(lambda: AverageMeter())
     valid_subsets = args.valid_subset.split(',')
     max_update = args.max_update or math.inf
+    if hasattr(args, "progressive") and args.progressive:
+        task.dataset("train").set_random_refine_step(args.refinetot, force_refine_step=force_refine_step)
+    last_samples = None
     for i, samples in enumerate(progress, start=epoch_itr.iterations_in_epoch):
+        if samples is None or len(samples) == 0:
+            sys.stderr.write("Empty sample detected\n")
+            sys.stderr.flush()
+            samples = last_samples
+        else:
+            last_samples = samples
         log_output = trainer.train_step(samples)
         if log_output is None:
             continue
-
         # log mid-epoch stats
         stats = get_training_stats(trainer)
         for k, v in log_output.items():
@@ -146,10 +198,17 @@ def train(args, trainer, task, epoch_itr):
             and num_updates > 0
         ):
             valid_losses = validate(args, trainer, task, epoch_itr, valid_subsets)
-            checkpoint_utils.save_checkpoint(args, trainer, epoch_itr, valid_losses[0])
+            if not hasattr(checkpoint_utils.save_checkpoint, 'best') or is_better(valid_losses[0], checkpoint_utils.save_checkpoint.best):
+                if distributed_utils.is_master(args):
+                    print("saving checkpoint ...")
+                    nsml.save("best")
+                checkpoint_utils.save_checkpoint.best = valid_losses[0]
 
         if num_updates >= max_update:
             break
+
+        if hasattr(args, "progressive") and args.progressive:
+            task.dataset("train").set_random_refine_step(args.refinetot, force_refine_step=force_refine_step)
 
     # log end-of-epoch stats
     stats = get_training_stats(trainer)
@@ -191,13 +250,20 @@ def get_training_stats(trainer):
     return stats
 
 
-def validate(args, trainer, task, epoch_itr, subsets):
+def validate(args, trainer, task, epoch_itr, subsets, force_refine_step=None):
     """Evaluate the model on the validation set(s) and return the losses."""
+    valid_random = np.random.RandomState(3)
+    valid_task_random = np.random.RandomState(3)
+    task_random_bak = task.random
+    task.random = valid_task_random
     valid_losses = []
     for subset in subsets:
         # Initialize data iterator
+        dataset = task.dataset(subset)
+        random_bak = dataset.random
+        dataset.random = valid_random
         itr = task.get_batch_iterator(
-            dataset=task.dataset(subset),
+            dataset=dataset,
             max_tokens=args.max_tokens_valid,
             max_sentences=args.max_sentences_valid,
             max_positions=utils.resolve_max_positions(
@@ -224,7 +290,13 @@ def validate(args, trainer, task, epoch_itr, subsets):
                 meter.reset()
         extra_meters = collections.defaultdict(lambda: AverageMeter())
 
+        if hasattr(args, "progressive") and args.progressive:
+            dataset.set_random_refine_step(args.refinetot, force_refine_step=force_refine_step)
         for sample in progress:
+            if sample is None or len(sample) == 0:
+                sys.stderr.write("empty valid sample detected\n")
+                sys.stderr.flush()
+                break
             log_output = trainer.valid_step(sample)
 
             for k, v in log_output.items():
@@ -232,13 +304,16 @@ def validate(args, trainer, task, epoch_itr, subsets):
                     continue
                 extra_meters[k].update(v)
 
+            if hasattr(args, "progressive") and args.progressive:
+                dataset.set_random_refine_step(args.refinetot, force_refine_step=force_refine_step)
         # log validation stats
         stats = get_valid_stats(trainer)
         for k, meter in extra_meters.items():
             stats[k] = meter.avg
         progress.print(stats, tag=subset, step=trainer.get_num_updates())
-
-        valid_losses.append(stats[args.best_checkpoint_metric].avg)
+        valid_losses.append(stats[args.best_checkpoint_metric] if type(stats[args.best_checkpoint_metric]) == float else stats[args.best_checkpoint_metric].avg)
+        dataset.random = random_bak
+    task.random = task_random_bak
     return valid_losses
 
 
@@ -262,11 +337,21 @@ def distributed_main(i, args, start_rank=0):
     args.device_id = i
     if args.distributed_rank is None:  # torch.multiprocessing.spawn
         args.distributed_rank = start_rank + i
-    main(args, init_distributed=True)
+    if args.decoder_wise_training:
+        print("| Start decoder-wise training for {} steps".format(args.refinetot))
+        for refine_step in range(args.refinetot):
+            print("| Start training {}-th refine step".format(refine_step))
+            main(args, init_distributed=True, progressive_training_step=refine_step)
+    else:
+        main(args, init_distributed=True)
 
 
 def cli_main():
     parser = options.get_training_parser()
+    parser.add_argument("--mask", action="store_true")
+    parser.add_argument("--decoder-wise-training", action="store_true")
+    parser.add_argument("--load", default="", type=str)
+    parser.add_argument("--masking", action="store_true")
     args = options.parse_args_and_arch(parser)
 
     if args.distributed_init_method is None:
@@ -299,6 +384,10 @@ def cli_main():
         )
     else:
         # single GPU training
+        main(args)
+
+    if args.mask:
+        args.masking = True
         main(args)
 
 

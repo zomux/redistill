@@ -287,7 +287,6 @@ class Trainer(object):
                     self.zero_grad()
                 else:
                     raise e
-
         if ooms > 0 and self._oom_batch is not None:
             self.handle_ooms(ooms)
 

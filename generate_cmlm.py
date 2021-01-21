@@ -8,6 +8,7 @@
 Translate pre-processed data with a trained model.
 """
 
+import os
 import torch
 import numpy as np
 import math
@@ -47,9 +48,22 @@ def main(args):
     strategy = strategies.setup_strategy(args)
 
     # Load ensemble
-    print('| loading model(s) from {}'.format(args.path))
-    models, _ = utils.load_ensemble_for_inference(args.path.split(':'), task, model_arg_overrides=eval(args.model_overrides))
-    models = [model.cuda() for model in models]
+    if args.path.startswith("nsml://"):
+        print("| loading nsml checkpoint", args.path)
+        import nsml
+        session = args.path.replace("nsml://", "")
+        model = task.build_model(args)
+        def load(dir_path):
+            state = torch.load(os.path.join(dir_path, 'best.pt'))
+            state_dict = state["model"]
+            model.load_state_dict(state_dict)
+            print("loaded")
+        nsml.load("best", load_fn=load, session=session)
+        models = [model.cuda()]
+    else:
+        print('| loading model(s) from {}'.format(args.path))
+        models, _ = utils.load_ensemble_for_inference(args.path.split(':'), task, model_arg_overrides=eval(args.model_overrides))
+        models = [model.cuda() for model in models]
 
     # Optimize ensemble for generation
     for model in models:
@@ -106,9 +120,9 @@ def main(args):
                         target_str = dehyphenate(target_str)
 
             if not args.quiet:
-                print('S-{}\t{}'.format(sample_id, src_str))
+                # print('S-{}\t{}'.format(sample_id, src_str))
                 if has_target:
-                    print('T-{}\t{}'.format(sample_id, target_str))
+                    # print('T-{}\t{}'.format(sample_id, target_str))
                     hypo_tokens, hypo_str, alignment = utils.post_process_prediction(
                         hypo_tokens=hypos.int().cpu(),
                         src_str=src_str,
@@ -121,13 +135,13 @@ def main(args):
                         hypo_str = dehyphenate(hypo_str)
 
                     if not args.quiet:
-                        print('H-{}\t{}'.format(sample_id, hypo_str))
+                        # print('H-{}\t{}'.format(sample_id, hypo_str))
                         if args.print_alignment:
                             print('A-{}\t{}'.format(
                                 sample_id,
                                 ' '.join(map(lambda x: str(utils.item(x)), alignment))
                             ))
-                        print()
+                        # print()
                         
                         # Score only the top hypothesis
                         if has_target:
@@ -142,7 +156,7 @@ def main(args):
         if has_target:
             print('Time = {}'.format(timer.elapsed_time))
             ref, out = zip(*results)
-            print('| Generate {} with beam={}: BLEU4 = {:2.2f}, '.format(args.gen_subset, args.beam, scorer.score(ref, out)))
+            print('| Generate {} with beam={}: BLEU4 = {:2.2f}, '.format(args.gen_subset, args.length_beam, scorer.score(ref, out)))
 
 
 def dehyphenate(sent):
@@ -207,7 +221,7 @@ def generate(strategy, encoder_input, models, tgt_dict, length_beam_size, gold_t
     avg_log_prob = lprobs / tgt_lengths.float()
     best_lengths = avg_log_prob.max(-1)[1]
     hypotheses = torch.stack([hypotheses[b, l, :] for b, l in enumerate(best_lengths)], dim=0)
-    
+
     return hypotheses
 
 
@@ -224,5 +238,13 @@ def predict_length_beam(gold_target_len, predicted_lengths, length_beam_size):
 
 if __name__ == '__main__':
     parser = options.get_generation_parser()
+    options.add_model_args(parser)
+    parser.add_argument("--all", action="store_true")
     args = options.parse_args_and_arch(parser)
-    main(args)
+    if args.all:
+        for i in [0, 2, 4, 8, 10]:
+            print("testing with iterations", i)
+            args.decoding_iterations = i
+            main(args)
+    else:
+        main(args)

@@ -14,7 +14,9 @@ from .concat_dataset import ConcatDataset
 from .indexed_dataset import IndexedCachedDataset, IndexedDataset, IndexedRawTextDataset, MMapIndexedDataset
 from .language_pair_dataset import LanguagePairDataset
 from .language_pair_self_dataset_mask import LanguagePairSelfDatasetMask
+from .language_pair_policy_dataset import LanguagePairSelfDatasetPolicy
 from .prepend_token_dataset import PrependTokenDataset
+
 
 from .iterators import (
     CountingIterator,
@@ -36,6 +38,7 @@ __all__ = [
     'IndexedRawTextDataset',
     'LanguagePairDataset',
     'LanguagePairSelfDatasetMask',
+    'LanguagePairSelfDatasetPolicy',
     'MMapIndexedDataset',
     'PrependTokenDataset',
     'ShardedIterator',

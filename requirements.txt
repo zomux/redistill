@@ -1,0 +1,7 @@
+#nsml: nsml/ml:cuda10.1-cudnn7-pytorch1.3keras2.3
+torchtext==0.4.0
+web-pdb
+line-profiler
+sacrebleu
+adamp
+prettytable

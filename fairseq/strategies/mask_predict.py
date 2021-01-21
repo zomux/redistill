@@ -17,6 +17,7 @@ class MaskPredict(DecodingStrategy):
     def __init__(self, args):
         super().__init__()
         self.iterations = args.decoding_iterations
+        self.progressive = hasattr(args, "progressive") and args.progressive
     
     def generate(self, model, encoder_out, tgt_tokens, tgt_dict):
         bsz, seq_len = tgt_tokens.size()
@@ -24,11 +25,13 @@ class MaskPredict(DecodingStrategy):
         seq_lens = seq_len - pad_mask.sum(dim=1)
         
         iterations = seq_len if self.iterations is None else self.iterations
-        
+
+        if self.progressive:
+            model.decoder.select_decoder(0)
         tgt_tokens, token_probs = self.generate_non_autoregressive(model, encoder_out, tgt_tokens)
         assign_single_value_byte(tgt_tokens, pad_mask, tgt_dict.pad())
         assign_single_value_byte(token_probs, pad_mask, 1.0)
-        #print("Initialization: ", convert_tokens(tgt_dict, tgt_tokens[0]))
+        # print("Initialization: ", convert_tokens(tgt_dict, tgt_tokens[9]))
         
         for counter in range(1, iterations):
             num_mask = (seq_lens.float() * (1.0 - (counter / iterations))).long()
@@ -38,17 +41,19 @@ class MaskPredict(DecodingStrategy):
             assign_single_value_long(tgt_tokens, mask_ind, tgt_dict.mask())
             assign_single_value_byte(tgt_tokens, pad_mask, tgt_dict.pad())
 
-            #print("Step: ", counter+1)
-            #print("Masking: ", convert_tokens(tgt_dict, tgt_tokens[0]))
+            # print("Step: ", counter+1)
+            # print("Masking: ", convert_tokens(tgt_dict, tgt_tokens[9]))
+            if self.progressive:
+                model.decoder.select_decoder(counter)
             decoder_out = model.decoder(tgt_tokens, encoder_out)
             new_tgt_tokens, new_token_probs, all_token_probs = generate_step_with_prob(decoder_out)
-            
+
             assign_multi_value_long(token_probs, mask_ind, new_token_probs)
             assign_single_value_byte(token_probs, pad_mask, 1.0)
-            
+
             assign_multi_value_long(tgt_tokens, mask_ind, new_tgt_tokens)
             assign_single_value_byte(tgt_tokens, pad_mask, tgt_dict.pad())
-            #print("Prediction: ", convert_tokens(tgt_dict, tgt_tokens[0]))
+            # print("Prediction: ", convert_tokens(tgt_dict, tgt_tokens[9]))
         
         lprobs = token_probs.log().sum(-1)
         return tgt_tokens, lprobs
