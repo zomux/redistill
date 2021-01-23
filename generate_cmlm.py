@@ -20,7 +20,7 @@ from fairseq.meters import TimeMeter
 from fairseq.strategies.strategy_utils import duplicate_encoder_out
 
 
-def main(args):
+def main(args, checkpoint_name="best"):
     assert args.path is not None, '--path required for generation!'
     assert not args.sampling or args.nbest == args.beam, \
         '--sampling requires --nbest to be equal to --beam'
@@ -58,7 +58,7 @@ def main(args):
             state_dict = state["model"]
             model.load_state_dict(state_dict)
             print("loaded")
-        nsml.load("best", load_fn=load, session=session)
+        nsml.load(checkpoint_name, load_fn=load, session=session)
         models = [model.cuda()]
     else:
         print('| loading model(s) from {}'.format(args.path))
@@ -240,11 +240,24 @@ if __name__ == '__main__':
     parser = options.get_generation_parser()
     options.add_model_args(parser)
     parser.add_argument("--all", action="store_true")
+    parser.add_argument("--stepwise", action="store_true")
+    parser.add_argument("--scan-checkpoints", action="store_true")
+    parser.add_argument("--end-iteration", default=-1, type=int)
     args = options.parse_args_and_arch(parser)
     if args.all:
         for i in [0, 2, 4, 8, 10]:
             print("testing with iterations", i)
             args.decoding_iterations = i
             main(args)
+    elif args.stepwise:
+        for i in range(args.decoding_iterations):
+            args.end_iteration = i
+            print("testing until iteration {}".format(i))
+            main(args)
+    elif args.scan_checkpoints:
+        for i in range(1, 31):
+            update_id = i * 20
+            print("Scan for update num:", update_id)
+            main(args, checkpoint_name=str(update_id))
     else:
         main(args)

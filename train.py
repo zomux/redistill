@@ -22,11 +22,22 @@ from fairseq import checkpoint_utils, distributed_utils, options, progress_bar, 
 from fairseq.data import iterators
 from fairseq.trainer import Trainer
 from fairseq.meters import AverageMeter, StopwatchMeter
-import nsml
-from nsml import DATASET_PATH
+try:
+    import nsml
+    from nsml import DATASET_PATH
+    HAS_NSML = True
+except ImportError:
+    HAS_NSML = False
+    DATASET_PATH = "{}/works/data/CMLM".format(os.getenv("HOME"))
+
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
 
 
-def main(args, init_distributed=False, progressive_training_step=None):
+def main(args, init_distributed=False):
     utils.import_user_module(args)
 
     assert args.max_tokens is not None or args.max_sentences is not None, \
@@ -41,6 +52,9 @@ def main(args, init_distributed=False, progressive_training_step=None):
 
     # Print args
     print(args)
+
+    if not HAS_NSML:
+        args.data[0] = args.data[0].replace("/train", "")
 
     # Setup task, e.g., translation, language modeling, etc.
     task = tasks.setup_task(args)
@@ -59,9 +73,16 @@ def main(args, init_distributed=False, progressive_training_step=None):
         sum(p.numel() for p in model.parameters() if p.requires_grad),
     ))
 
+    # Setup session
+    if HAS_WANDB and distributed_utils.is_master(args):
+        wandb.init(project="cmlm", config=args)
+        wandb.watch(model)
+
     # Load pre-trained model
     data_token = args.data[0].split("/")[-1]
     pretrained_path = "{}/train/pretrained_models/maskPredict_{}/checkpoint_best.pt".format(DATASET_PATH, data_token.split(".")[-1].replace("-", "_"))
+    if not HAS_NSML:
+        pretrained_path = pretrained_path.replace("/train", "")
     print("| loading", pretrained_path)
     state = checkpoint_utils.load_checkpoint_to_cpu(pretrained_path)
     model.load_state_dict(state["model"], strict=True)
@@ -71,7 +92,7 @@ def main(args, init_distributed=False, progressive_training_step=None):
         baseline_model.cuda()
     task.set_baseline_model(baseline_model)
 
-    if not args.masking:
+    if not args.masking and HAS_NSML:
         def nsml_bind(model):
             def save(dir_path):
                 state = {
@@ -80,8 +101,9 @@ def main(args, init_distributed=False, progressive_training_step=None):
                 torch.save(state, os.path.join(dir_path, 'best.pt'))
 
             def load(dir_path):
-                state = torch.load(os.path.join(dir_path, 'best.pt'))
+                state = torch.load(os.path.join(dir_path, 'best.pt'), map_location="cpu")
                 model.load_state_dict(state['model'], strict=False)
+                model.cuda()
                 print('model loaded!')
             nsml.bind(save=save, load=load)
         nsml_bind(model)
@@ -90,6 +112,13 @@ def main(args, init_distributed=False, progressive_training_step=None):
         print("loading model from session", args.load)
         session = args.load.replace("nsml://", "")
         nsml.load("best", session=session)
+
+    # Prepare for decoder wise training
+    if args.decoder_wise_training:
+        print("| Decoder wise training, start refinement step 0")
+        progressive_training_step = 0
+    else:
+        progressive_training_step = None
 
     # Build trainer
     trainer = Trainer(args, task, model, criterion)
@@ -125,6 +154,9 @@ def main(args, init_distributed=False, progressive_training_step=None):
         else:
             valid_losses = [None]
 
+        if args.decoder_wise_training:
+            progressive_training_step = update_num_to_refine_step(trainer.get_num_updates())
+
         # only use first validation loss to update the learning rate
         lr = trainer.lr_step(epoch_itr.epoch, valid_losses[0])
 
@@ -138,6 +170,9 @@ def main(args, init_distributed=False, progressive_training_step=None):
     train_meter.stop()
     print('| done training in {:.1f} seconds'.format(train_meter.sum))
 
+def update_num_to_refine_step(update_num):
+    refine_step = int(update_num / 5000)
+    return refine_step
 
 def train(args, trainer, task, epoch_itr, force_refine_step=None):
     """Train the model for one epoch."""
@@ -197,12 +232,35 @@ def train(args, trainer, task, epoch_itr, force_refine_step=None):
             and num_updates % args.save_interval_updates == 0
             and num_updates > 0
         ):
-            valid_losses = validate(args, trainer, task, epoch_itr, valid_subsets)
+            valid_losses = validate(args, trainer, task, epoch_itr, valid_subsets, force_refine_step=force_refine_step)
+            # if distributed_utils.is_master(args):
+            #     print("saving:", trainer.get_num_updates())
+            #     nsml.save(str(trainer.get_num_updates()))
             if not hasattr(checkpoint_utils.save_checkpoint, 'best') or is_better(valid_losses[0], checkpoint_utils.save_checkpoint.best):
                 if distributed_utils.is_master(args):
                     print("saving checkpoint ...")
-                    nsml.save("best")
+                    sys.stdout.flush()
+                    if HAS_NSML:
+                        nsml.save("best")
+                    else:
+                        torch.save({"model": trainer.get_model().state_dict()}, "/tmp/best.pt")
+                    if HAS_WANDB:
+                        wandb.save("/tmp/best.pt", base_path="/checkpoints")
+                    print("done")
+                    sys.stdout.flush()
                 checkpoint_utils.save_checkpoint.best = valid_losses[0]
+
+        if args.decoder_wise_training and update_num_to_refine_step(num_updates) != force_refine_step:
+            if HAS_NSML:
+                nsml.load("best")
+            else:
+                state = torch.load("/tmp/best.pt", map_location="cpu")
+                trainer.get_model().load_state_dict(state)
+            checkpoint_utils.save_checkpoint.best = 0.
+            force_refine_step = update_num_to_refine_step(num_updates)
+            trainer.criterion.pool.clear()
+            print("| Start refinement step:", force_refine_step)
+
 
         if num_updates >= max_update:
             break
@@ -313,6 +371,15 @@ def validate(args, trainer, task, epoch_itr, subsets, force_refine_step=None):
         progress.print(stats, tag=subset, step=trainer.get_num_updates())
         valid_losses.append(stats[args.best_checkpoint_metric] if type(stats[args.best_checkpoint_metric]) == float else stats[args.best_checkpoint_metric].avg)
         dataset.random = random_bak
+
+        if HAS_WANDB and distributed_utils.is_master(args):
+            stat_dict = {}
+            for k, v in stats.items():
+                if isinstance(v, AverageMeter):
+                    stat_dict[k] = v.val
+                else:
+                    stat_dict[k] = v
+            wandb.log(stat_dict, step=trainer.get_num_updates())
     task.random = task_random_bak
     return valid_losses
 
@@ -337,12 +404,6 @@ def distributed_main(i, args, start_rank=0):
     args.device_id = i
     if args.distributed_rank is None:  # torch.multiprocessing.spawn
         args.distributed_rank = start_rank + i
-    if args.decoder_wise_training:
-        print("| Start decoder-wise training for {} steps".format(args.refinetot))
-        for refine_step in range(args.refinetot):
-            print("| Start training {}-th refine step".format(refine_step))
-            main(args, init_distributed=True, progressive_training_step=refine_step)
-    else:
         main(args, init_distributed=True)
 
 

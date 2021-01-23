@@ -17,6 +17,7 @@ class MaskPredict(DecodingStrategy):
     def __init__(self, args):
         super().__init__()
         self.iterations = args.decoding_iterations
+        self.end_iteration = args.end_iteration
         self.progressive = hasattr(args, "progressive") and args.progressive
     
     def generate(self, model, encoder_out, tgt_tokens, tgt_dict):
@@ -32,8 +33,10 @@ class MaskPredict(DecodingStrategy):
         assign_single_value_byte(tgt_tokens, pad_mask, tgt_dict.pad())
         assign_single_value_byte(token_probs, pad_mask, 1.0)
         # print("Initialization: ", convert_tokens(tgt_dict, tgt_tokens[9]))
-        
+
         for counter in range(1, iterations):
+            if self.end_iteration != -1 and counter > self.end_iteration:
+                break
             num_mask = (seq_lens.float() * (1.0 - (counter / iterations))).long()
 
             assign_single_value_byte(token_probs, pad_mask, 1.0)
@@ -54,6 +57,8 @@ class MaskPredict(DecodingStrategy):
             assign_multi_value_long(tgt_tokens, mask_ind, new_tgt_tokens)
             assign_single_value_byte(tgt_tokens, pad_mask, tgt_dict.pad())
             # print("Prediction: ", convert_tokens(tgt_dict, tgt_tokens[9]))
+            if counter == self.end_iteration:
+                break
         
         lprobs = token_probs.log().sum(-1)
         return tgt_tokens, lprobs

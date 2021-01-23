@@ -8,22 +8,23 @@ from .lib_sbleu import smoothed_bleu
 
 POOL_SIZE = 20000
 
-@register_criterion('policy_reward_bak')
+@register_criterion('policy_reward_onpolicy')
 class PolicyRewardCriterion(FairseqCriterion):
 
     def __init__(self, args, task):
         self.pool = []
+        self.progressive = hasattr(args, "progressive") and args.progressive
+        assert not args.offpolicy
         super().__init__(args, task)
 
     @staticmethod
     def add_args(parser):
         """Add criterion-specific arguments to the parser."""
         # fmt: off
-        parser.add_argument('--klreg', default=0.5, type=float)
+        parser.add_argument('--klreg', default=0, type=float)
         parser.add_argument("--sampling-temp", default=0.5, type=float)
         parser.add_argument("--offpolicy", action="store_true")
         parser.add_argument("--tokenwise", action="store_true")
-        parser.add_argument("--expool", action="store_true")
         # fmt: on
 
     def forward(self, model, sample, reduce=True):
@@ -34,6 +35,9 @@ class PolicyRewardCriterion(FairseqCriterion):
         2) the sample size, which is used as the denominator for the gradient
         3) logging outputs to display while training
         """
+        if self.progressive:
+            random_refine_step = sample["random_refine_step"]
+            model.decoder.select_decoder(random_refine_step)
         net_output = model(**sample['net_input'])
         loss, reward, sample_reward, avgkl = self.compute_loss(model, net_output, sample, reduce=reduce)
         sample_size = sample['target'].size(0)
@@ -65,17 +69,12 @@ class PolicyRewardCriterion(FairseqCriterion):
         # >>>>>> Compute baseline >>>>>>>>
         with torch.no_grad():
             baseline_logits = self.task.baseline_model()(**sample['net_input'])[0]
-            baseline_log_probs = torch.log_softmax(baseline_logits / self.args.sampling_temp, 2)
+            # baseline_log_probs = torch.log_softmax(baseline_logits / self.args.sampling_temp, 2)
             baseline_ypred = baseline_logits.argmax(2)
             baseline_ypred = baseline_ypred * cmlm_mask + y_input * cmlm_mask.logical_not()
         # >>>>>> Obtain sample >>>>>>>>
         B, T, _ = probs.shape
-        if not self.args.offpolicy:
-            y_sample = torch.multinomial(probs.view(B*T, -1), 1).view(B, T)
-        else:
-            with torch.no_grad():
-                baseline_probs = torch.exp(baseline_log_probs)
-                y_sample = torch.multinomial(baseline_probs.view(B * T, -1), 1).view(B, T)
+        y_sample = torch.multinomial(probs.view(B*T, -1), 1).view(B, T)
         y_sample = y_sample * cmlm_mask + y_input * cmlm_mask.logical_not()
         logp_mat = log_probs.view(B*T, -1)[torch.arange(B*T), y_sample.flatten()].view(B, T)
         # >>>>>> Compute reward >>>>>>>>
@@ -83,30 +82,17 @@ class PolicyRewardCriterion(FairseqCriterion):
         baseline_reward = self.compute_reward(baseline_ypred * y_mask, true_target * y_mask)
         reward = self.compute_reward(y_pred * y_mask, true_target * y_mask) - baseline_reward
         sample_reward = sample_reward - baseline_reward
-        if self.args.offpolicy:
-            with torch.no_grad():
-                baseline_logp_mat = baseline_log_probs.view(B*T, -1)[torch.arange(B*T), y_sample.flatten()].view(B, T)
         # >>>>>> Compute loss signal >>>>>>>>
-        # >>>>>> Compute loss signal >>>>>>>>
-        kldiv = ((probs * (log_probs - baseline_log_probs)).sum(2) * cmlm_mask).sum(1)
+        # >>>>>> Only for on-policy training >>>>>>>>
+        # kldiv = ((probs * (log_probs - baseline_log_probs)).sum(2) * cmlm_mask).sum(1)
+        kldiv = cmlm_mask.sum(1).float() * 0.
         if self.args.tokenwise:
-            if self.args.offpolicy:
-                with torch.no_grad():
-                    importance_weight = torch.exp(logp_mat - baseline_logp_mat)
-                logp_mat = importance_weight * logp_mat
             reward = reward / cmlm_mask.sum(1)
             sample_reward = sample_reward / cmlm_mask.sum(1)
-            loss = (- sample_reward[:, None] * logp_mat * cmlm_mask).sum(1) / cmlm_mask.sum(1) + self.args.klreg * kldiv / cmlm_mask.sum(1)
-            if float(sample_reward.mean()) < -1:
-                from lib_nsmldebug import set_trace
-                set_trace()
+            loss = (- sample_reward[:, None] * logp_mat * cmlm_mask).sum(1) / cmlm_mask.sum(1) # + self.args.klreg * kldiv / cmlm_mask.sum(1)
         else:
             logp = (logp_mat * cmlm_mask).sum(1)
-            if self.args.offpolicy:
-                with torch.no_grad():
-                    importance_weight = torch.exp(((logp_mat - baseline_logp_mat) * cmlm_mask).sum(1))
-                logp = importance_weight * logp
-            loss = - sample_reward * logp + self.args.klreg * kldiv
+            loss = - sample_reward * logp # + self.args.klreg * kldiv
         avgkl = kldiv / cmlm_mask.sum(1)
         if reduce:
             loss = loss.sum()

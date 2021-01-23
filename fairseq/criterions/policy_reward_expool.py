@@ -20,7 +20,7 @@ class PolicyRewardExPoolCriterion(FairseqCriterion):
         self.stable_reward = args.stablereward
         self.reward_history = []
         self.progressive = hasattr(args, "progressive") and args.progressive
-        if self.progressive:
+        if self.progressive and not args.decoder_wise_training:
             POOL_SIZE = 80000
         super().__init__(args, task)
 
