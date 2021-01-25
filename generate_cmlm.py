@@ -60,6 +60,23 @@ def main(args, checkpoint_name="best"):
             print("loaded")
         nsml.load(checkpoint_name, load_fn=load, session=session)
         models = [model.cuda()]
+    elif args.path.startswith("wb://"):
+        print("| loading wb checkpoint", args.path)
+        import wandb
+        wandb.restore("best.pt", args.path.replace("wb://", ""), root="/tmp/")
+        assert os.path.exists("/tmp/best.pt")
+        state = torch.load("/tmp/best.pt")
+        model = task.build_model(args)
+        model.load_state_dict(state["model"])
+        models = [model.cuda()]
+    elif args.path.startswith("http://"):
+        print("| loading http checkpoint", args.path)
+        url = "http://trains.deeplearn.org:8081/{}".format(args.path.replace("http://", ""))
+        os.system("curl -o /tmp/model.pt {}".format(url))
+        state = torch.load("/tmp/model.pt")
+        model = task.build_model(args)
+        model.load_state_dict(state["model"])
+        models = [model.cuda()]
     else:
         print('| loading model(s) from {}'.format(args.path))
         models, _ = utils.load_ensemble_for_inference(args.path.split(':'), task, model_arg_overrides=eval(args.model_overrides))

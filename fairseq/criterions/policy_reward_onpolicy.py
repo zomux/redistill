@@ -14,6 +14,15 @@ class PolicyRewardCriterion(FairseqCriterion):
     def __init__(self, args, task):
         self.pool = []
         self.progressive = hasattr(args, "progressive") and args.progressive
+        self.exposure1 = args.exposure1
+        self.tgt_dict = task.tgt_dict
+        if args.exposure1:
+            from fairseq.strategies.mask_predict import MaskPredict
+            args.end_iteration = -1
+            args.decoding_iterations = args.refinetot
+            self.strategy = MaskPredict(args, exit_after_mask=True)
+        else:
+            self.strategy = None
         assert not args.offpolicy
         super().__init__(args, task)
 
@@ -25,7 +34,25 @@ class PolicyRewardCriterion(FairseqCriterion):
         parser.add_argument("--sampling-temp", default=0.5, type=float)
         parser.add_argument("--offpolicy", action="store_true")
         parser.add_argument("--tokenwise", action="store_true")
+        parser.add_argument("--exposure1", action="store_true", help="refine during training")
         # fmt: on
+
+    def perform_refinement(self, model, sample, encoder_out):
+        assert "random_refine_step" in sample
+        random_refine_step = sample["random_refine_step"]
+        was_training = model.training
+        model.eval()
+        y_input = sample["net_input"]["prev_output_tokens"]
+        y_mask = (y_input != 1)
+        y_input = (y_mask * 0 + 4) * y_mask + y_input * y_mask.logical_not()
+        if random_refine_step == 0:
+            return y_input
+        with torch.no_grad():
+            self.strategy.end_iteration = random_refine_step - 1
+            out_tokens, _ = self.strategy.generate(model, encoder_out, y_input, self.tgt_dict)
+        if was_training:
+            model.train()
+        return out_tokens
 
     def forward(self, model, sample, reduce=True):
         """Compute the loss for the given sample.
@@ -35,11 +62,19 @@ class PolicyRewardCriterion(FairseqCriterion):
         2) the sample size, which is used as the denominator for the gradient
         3) logging outputs to display while training
         """
+        net_input = sample["net_input"]
+        with torch.no_grad():
+            encoder_out = model.encoder(net_input["src_tokens"], src_lengths=net_input["src_lengths"])
+        if self.exposure1:
+            y_input = self.perform_refinement(model, sample, encoder_out)
+            sample["net_input"]["prev_output_tokens"] = y_input
+        else:
+            y_input = net_input["prev_output_tokens"]
         if self.progressive:
             random_refine_step = sample["random_refine_step"]
             model.decoder.select_decoder(random_refine_step)
-        net_output = model(**sample['net_input'])
-        loss, reward, sample_reward, avgkl = self.compute_loss(model, net_output, sample, reduce=reduce)
+        net_output = model.decoder(y_input, encoder_out=encoder_out)
+        loss, reward, sample_reward, avgkl = self.compute_loss(model, encoder_out, net_output, sample, reduce=reduce)
         sample_size = sample['target'].size(0)
         logging_output = {
             'loss': utils.item(loss.data) if reduce else loss.data,
@@ -55,7 +90,7 @@ class PolicyRewardCriterion(FairseqCriterion):
     def compute_reward(self, y_sample, true_target):
         return self._sbleu(y_sample, true_target)
 
-    def compute_loss(self, model, net_output, sample, reduce=True):
+    def compute_loss(self, model, encoder_out, net_output, sample, reduce=True):
         y_input = sample["net_input"]["prev_output_tokens"]
         y_mask = (y_input != 1)
         cmlm_mask = (y_input == 4)
@@ -68,7 +103,7 @@ class PolicyRewardCriterion(FairseqCriterion):
         y_pred = y_pred * cmlm_mask + y_input * cmlm_mask.logical_not()
         # >>>>>> Compute baseline >>>>>>>>
         with torch.no_grad():
-            baseline_logits = self.task.baseline_model()(**sample['net_input'])[0]
+            baseline_logits = self.task.baseline_model().decoder(y_input, encoder_out=encoder_out)[0]
             # baseline_log_probs = torch.log_softmax(baseline_logits / self.args.sampling_temp, 2)
             baseline_ypred = baseline_logits.argmax(2)
             baseline_ypred = baseline_ypred * cmlm_mask + y_input * cmlm_mask.logical_not()

@@ -17,7 +17,7 @@ import random
 import numpy as np
 
 import torch
-
+from torch.nn import parallel
 from fairseq import checkpoint_utils, distributed_utils, options, progress_bar, tasks, utils
 from fairseq.data import iterators
 from fairseq.trainer import Trainer
@@ -117,6 +117,7 @@ def main(args, init_distributed=False):
     if args.decoder_wise_training:
         print("| Decoder wise training, start refinement step 0")
         progressive_training_step = 0
+        assert args.ddp_backend == "c10d"
     else:
         progressive_training_step = None
 
@@ -245,8 +246,7 @@ def train(args, trainer, task, epoch_itr, force_refine_step=None):
                     else:
                         torch.save({"model": trainer.get_model().state_dict()}, "/tmp/best.pt")
                     if HAS_WANDB:
-                        wandb.save("/tmp/best.pt", base_path="/checkpoints")
-                    print("done")
+                        wandb.save("/tmp/best.pt")
                     sys.stdout.flush()
                 checkpoint_utils.save_checkpoint.best = valid_losses[0]
 
@@ -254,8 +254,15 @@ def train(args, trainer, task, epoch_itr, force_refine_step=None):
             if HAS_NSML:
                 nsml.load("best")
             else:
-                state = torch.load("/tmp/best.pt", map_location="cpu")
-                trainer.get_model().load_state_dict(state)
+                # Retrieve the model
+                if distributed_utils.is_master(args):
+                    state = torch.load("/tmp/best.pt", map_location="cpu")
+                    trainer.model.load_state_dict(state["model"])
+                # Sync
+                assert isinstance(trainer.model, parallel.DistributedDataParallel)
+                if isinstance(trainer.model, parallel.DistributedDataParallel):
+                    trainer.model._sync_params()
+
             checkpoint_utils.save_checkpoint.best = 0.
             force_refine_step = update_num_to_refine_step(num_updates)
             trainer.criterion.pool.clear()

@@ -281,6 +281,7 @@ class Trainer(object):
                     # printed out if another exception happens
                     # print(msg)
                     print(msg, file=sys.stderr)
+                    sys.stdout.flush()
                     if raise_oom:
                         raise ValueError(msg)
                     ooms += 1

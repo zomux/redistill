@@ -14,13 +14,14 @@ from .strategy_utils import generate_step_with_prob, assign_single_value_long, a
 @register_strategy('mask_predict')
 class MaskPredict(DecodingStrategy):
     
-    def __init__(self, args):
+    def __init__(self, args, exit_after_mask=False):
         super().__init__()
         self.iterations = args.decoding_iterations
         self.end_iteration = args.end_iteration
+        self.exit_after_mask = exit_after_mask
         self.progressive = hasattr(args, "progressive") and args.progressive
     
-    def generate(self, model, encoder_out, tgt_tokens, tgt_dict):
+    def generate(self, model, encoder_out, tgt_tokens, tgt_dict, return_token_probs=False):
         bsz, seq_len = tgt_tokens.size()
         pad_mask = tgt_tokens.eq(tgt_dict.pad())
         seq_lens = seq_len - pad_mask.sum(dim=1)
@@ -35,7 +36,7 @@ class MaskPredict(DecodingStrategy):
         # print("Initialization: ", convert_tokens(tgt_dict, tgt_tokens[9]))
 
         for counter in range(1, iterations):
-            if self.end_iteration != -1 and counter > self.end_iteration:
+            if self.end_iteration != -1 and counter > self.end_iteration and not self.exit_after_mask:
                 break
             num_mask = (seq_lens.float() * (1.0 - (counter / iterations))).long()
 
@@ -44,6 +45,8 @@ class MaskPredict(DecodingStrategy):
             assign_single_value_long(tgt_tokens, mask_ind, tgt_dict.mask())
             assign_single_value_byte(tgt_tokens, pad_mask, tgt_dict.pad())
 
+            if self.end_iteration != -1 and counter > self.end_iteration and self.exit_after_mask:
+                break
             # print("Step: ", counter+1)
             # print("Masking: ", convert_tokens(tgt_dict, tgt_tokens[9]))
             if self.progressive:
@@ -57,11 +60,11 @@ class MaskPredict(DecodingStrategy):
             assign_multi_value_long(tgt_tokens, mask_ind, new_tgt_tokens)
             assign_single_value_byte(tgt_tokens, pad_mask, tgt_dict.pad())
             # print("Prediction: ", convert_tokens(tgt_dict, tgt_tokens[9]))
-            if counter == self.end_iteration:
+            if counter == self.end_iteration and not self.exit_after_mask:
                 break
         
         lprobs = token_probs.log().sum(-1)
-        return tgt_tokens, lprobs
+        return tgt_tokens, token_probs if return_token_probs else lprobs
     
     def generate_non_autoregressive(self, model, encoder_out, tgt_tokens):
         decoder_out = model.decoder(tgt_tokens, encoder_out)
