@@ -173,6 +173,9 @@ def main(args, checkpoint_name="best"):
         if has_target:
             print('Time = {}'.format(timer.elapsed_time))
             ref, out = zip(*results)
+            from fairseq.criterions.lib_sbleu import smoothed_bleu
+            sbleu = np.mean([smoothed_bleu(p[0].split(), p[1].split()) for p in results])
+            print("| SBLEU = {:.2f}".format(sbleu))
             print('| Generate {} with beam={}: BLEU4 = {:2.2f}, '.format(args.gen_subset, args.length_beam, scorer.score(ref, out)))
 
 

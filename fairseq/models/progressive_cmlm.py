@@ -30,9 +30,10 @@ from .bert_seq2seq import BertLayerNorm, TransformerEncoder, PositionalEmbedding
 
 @register_model('bert_transformer_seq2seq')
 class Transformer_nonautoregressive(FairseqModel):
-    def __init__(self, encoder, decoder, progressive=False, light=False):
+    def __init__(self, encoder, decoder, progressive=False, light=False, masker=False):
         self.progressive = progressive
         self.light = light
+        self.masker = True
         super().__init__(encoder, decoder)
         self.apply(self.init_bert_weights)
 
@@ -117,6 +118,7 @@ class Transformer_nonautoregressive(FairseqModel):
         parser.add_argument('--encoder-embed-scale', type=float,
                             help='scaling factor for embeddings used in encoder')
         parser.add_argument("--progressive", action="store_true")
+        parser.add_argument("--masker", action="store_true", help="token masking model")
         parser.add_argument("--light", action="store_true", help="train only the last decoder layer")
         parser.add_argument("--refinestep", default=0, type=int)
         parser.add_argument("--refinetot", default=0, type=int)
@@ -172,14 +174,17 @@ class Transformer_nonautoregressive(FairseqModel):
 
         light = hasattr(args, "light") and args.light
         encoder = TransformerEncoder(args, src_dict, encoder_embed_tokens, args.encoder_embed_scale)
+        masker = hasattr(args, "masker") and args.masker
         if hasattr(args, "progressive") and args.progressive:
-            decoder = ProgressiveSelfTransformerDecoder(args, tgt_dict, decoder_embed_tokens, args.decoder_embed_scale, light=light)
+            decoder = ProgressiveSelfTransformerDecoder(args, tgt_dict, decoder_embed_tokens, args.decoder_embed_scale, light=light, masker=masker)
         else:
             decoder = SelfTransformerDecoder(args, tgt_dict, decoder_embed_tokens, args.decoder_embed_scale)
         progressive = hasattr(args, "progressive") and args.progressive
-        return Transformer_nonautoregressive(encoder, decoder, progressive=progressive, light=light)
+        return Transformer_nonautoregressive(encoder, decoder, progressive=progressive, light=light, masker=masker)
 
     def load_state_dict(self, state_dict, strict=True):
+        if self.masker:
+            strict = False
         if self.progressive:
             keys = list(state_dict.keys())
             for key in keys:
@@ -214,9 +219,10 @@ class ProgressiveSelfTransformerDecoder(FairseqIncrementalDecoder):
     """
 
     def __init__(self, args, dictionary, embed_tokens, embed_scale=None, no_encoder_attn=False, left_pad=False,
-                 final_norm=True, light=False):
+                 final_norm=True, light=False, masker=False):
         super().__init__(dictionary)
         self.light = light
+        self.masker = masker
         self.dropout = args.dropout
         self.share_input_output_embed = args.share_decoder_input_output_embed
 
@@ -265,6 +271,19 @@ class ProgressiveSelfTransformerDecoder(FairseqIncrementalDecoder):
                     for _ in range(args.decoder_layers)
                 ])
                 self.layer_stack.append(layers)
+
+        if self.masker:
+            self.masker_stack = nn.ModuleList()
+            for _ in range(args.refinetot - 1):
+                layers = nn.ModuleList([])
+                layers.extend([
+                    TransformerDecoderLayer(args, no_encoder_attn)
+                    for _ in range(3)
+                ])
+                self.masker_stack.append(layers)
+            self.masker_predict_stack = nn.ModuleList()
+            for _ in range(args.refinetot - 1):
+                self.masker_predict_stack.append(nn.Linear(args.decoder_output_dim, 1))
 
 
         self.adaptive_softmax = None
@@ -328,6 +347,23 @@ class ProgressiveSelfTransformerDecoder(FairseqIncrementalDecoder):
         x = self.embed_tokens(prev_output_tokens)
         if self.project_in_dim is not None:
             x = self.project_in_dim(x)
+        # Masking token embeddings using masker
+        if self.masker and self.selected_decoder > 0:
+            masker_h = F.dropout(x, p=self.dropout, training=self.training).transpose(0, 1)
+            masker_layers = self.masker_stack[self.selected_decoder - 1]
+            for layer in masker_layers:
+                masker_h, _ = layer(
+                    masker_h,
+                    encoder_out['encoder_out'] if encoder_out is not None else None,
+                    encoder_out['encoder_padding_mask'] if encoder_out is not None else None,
+                    decoder_padding_mask,
+                )
+            masker_h = masker_h.transpose(0, 1)
+            masking_prob = torch.sigmoid(self.masker_predict_stack[self.selected_decoder - 1](masker_h).sum(2))
+            y_mask = prev_output_tokens != 1
+            full_mask_y = (prev_output_tokens * 0 + 4) * y_mask + prev_output_tokens * y_mask.logical_not()
+            mask_embed = self.embed_tokens(full_mask_y)
+            x = masking_prob[:, :, None] * mask_embed + (1 - masking_prob)[:, :, None] * x
 
         if positions is not None:
             x += positions
@@ -365,8 +401,10 @@ class ProgressiveSelfTransformerDecoder(FairseqIncrementalDecoder):
             else:
                 x = F.linear(x, self.embed_out)
 
-        return x, {'attn': attn, 'inner_states': inner_states, 'predicted_lengths': encoder_out['predicted_lengths']}
-
+        decoder_out_dict = {'attn': attn, 'inner_states': inner_states, 'predicted_lengths': encoder_out['predicted_lengths']}
+        if self.masker and self.selected_decoder > 0:
+            decoder_out_dict["masking_prob"] = masking_prob
+        return x, decoder_out_dict
     def max_positions(self):
         """Maximum output length supported by the decoder."""
         if self.embed_positions is None:

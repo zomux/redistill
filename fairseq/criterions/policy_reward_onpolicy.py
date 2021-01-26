@@ -14,13 +14,14 @@ class PolicyRewardCriterion(FairseqCriterion):
     def __init__(self, args, task):
         self.pool = []
         self.progressive = hasattr(args, "progressive") and args.progressive
+        self.masker = hasattr(args, "masker") and args.masker
         self.exposure1 = args.exposure1
         self.tgt_dict = task.tgt_dict
         if args.exposure1:
             from fairseq.strategies.mask_predict import MaskPredict
             args.end_iteration = -1
             args.decoding_iterations = args.refinetot
-            self.strategy = MaskPredict(args, exit_after_mask=True)
+            self.strategy = MaskPredict(args, exit_after_mask=False if self.masker else True)
         else:
             self.strategy = None
         assert not args.offpolicy
@@ -98,19 +99,31 @@ class PolicyRewardCriterion(FairseqCriterion):
         logits = net_output[0]
         # >>>>>> Compute policy >>>>>>>>
         probs = torch.softmax(logits / self.args.sampling_temp, 2).clamp(min=1e-8, max=1.)
+        if self.masker and model.decoder.selected_decoder > 0:
+            input_onehot = torch.nn.functional.one_hot(y_input, logits.shape[2])
+            masking_prob = net_output[1]["masking_prob"]
+            probs = masking_prob[:, :, None] * input_onehot + (1 - masking_prob[:, :, None]) * probs
         log_probs = torch.log(probs)
         y_pred = logits.argmax(2)
-        y_pred = y_pred * cmlm_mask + y_input * cmlm_mask.logical_not()
+        if self.masker:
+            y_pred = y_pred * y_mask
+        else:
+            y_pred = y_pred * cmlm_mask + y_input * cmlm_mask.logical_not()
         # >>>>>> Compute baseline >>>>>>>>
-        with torch.no_grad():
-            baseline_logits = self.task.baseline_model().decoder(y_input, encoder_out=encoder_out)[0]
-            # baseline_log_probs = torch.log_softmax(baseline_logits / self.args.sampling_temp, 2)
-            baseline_ypred = baseline_logits.argmax(2)
-            baseline_ypred = baseline_ypred * cmlm_mask + y_input * cmlm_mask.logical_not()
+        if self.masker and model.decoder.selected_decoder > 0:
+            baseline_ypred = y_input.detach()
+        else:
+            with torch.no_grad():
+                baseline_logits = self.task.baseline_model().decoder(y_input, encoder_out=encoder_out)[0]
+                # baseline_log_probs = torch.log_softmax(baseline_logits / self.args.sampling_temp, 2)
+                baseline_ypred = baseline_logits.argmax(2)
+                baseline_ypred = baseline_ypred * cmlm_mask + y_input * cmlm_mask.logical_not()
+
         # >>>>>> Obtain sample >>>>>>>>
         B, T, _ = probs.shape
         y_sample = torch.multinomial(probs.view(B*T, -1), 1).view(B, T)
-        y_sample = y_sample * cmlm_mask + y_input * cmlm_mask.logical_not()
+        if not self.masker:
+            y_sample = y_sample * cmlm_mask + y_input * cmlm_mask.logical_not()
         logp_mat = log_probs.view(B*T, -1)[torch.arange(B*T), y_sample.flatten()].view(B, T)
         # >>>>>> Compute reward >>>>>>>>
         sample_reward = self.compute_reward(y_sample * y_mask, true_target * y_mask)
@@ -120,15 +133,18 @@ class PolicyRewardCriterion(FairseqCriterion):
         # >>>>>> Compute loss signal >>>>>>>>
         # >>>>>> Only for on-policy training >>>>>>>>
         # kldiv = ((probs * (log_probs - baseline_log_probs)).sum(2) * cmlm_mask).sum(1)
-        kldiv = cmlm_mask.sum(1).float() * 0.
+        kldiv = baseline_reward if self.masker else cmlm_mask.sum(1).float() * 0.
         if self.args.tokenwise:
             reward = reward / cmlm_mask.sum(1)
             sample_reward = sample_reward / cmlm_mask.sum(1)
             loss = (- sample_reward[:, None] * logp_mat * cmlm_mask).sum(1) / cmlm_mask.sum(1) # + self.args.klreg * kldiv / cmlm_mask.sum(1)
         else:
-            logp = (logp_mat * cmlm_mask).sum(1)
+            if self.masker:
+                logp = (logp_mat * y_mask).sum(1)
+            else:
+                logp = (logp_mat * cmlm_mask).sum(1)
             loss = - sample_reward * logp # + self.args.klreg * kldiv
-        avgkl = kldiv / cmlm_mask.sum(1)
+        avgkl = baseline_reward if self.masker else kldiv / cmlm_mask.sum(1)
         if reduce:
             loss = loss.sum()
             reward = reward.sum()

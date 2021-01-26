@@ -34,7 +34,6 @@ class MaskPredict(DecodingStrategy):
         assign_single_value_byte(tgt_tokens, pad_mask, tgt_dict.pad())
         assign_single_value_byte(token_probs, pad_mask, 1.0)
         # print("Initialization: ", convert_tokens(tgt_dict, tgt_tokens[9]))
-
         for counter in range(1, iterations):
             if self.end_iteration != -1 and counter > self.end_iteration and not self.exit_after_mask:
                 break
@@ -62,7 +61,6 @@ class MaskPredict(DecodingStrategy):
             # print("Prediction: ", convert_tokens(tgt_dict, tgt_tokens[9]))
             if counter == self.end_iteration and not self.exit_after_mask:
                 break
-        
         lprobs = token_probs.log().sum(-1)
         return tgt_tokens, token_probs if return_token_probs else lprobs
     
