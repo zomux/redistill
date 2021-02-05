@@ -15,8 +15,10 @@ def duplicate_encoder_out(encoder_out, bsz, beam_size):
         encoder_out['encoder_padding_mask'] = encoder_out['encoder_padding_mask'].unsqueeze(1).repeat(1, beam_size, 1).view(bsz * beam_size, -1)
 
 
-def generate_step_with_prob(out):
+def generate_step_with_prob(out, ensemble_prob=None):
     probs = F.softmax(out[0], dim=-1)
+    if ensemble_prob is not None:
+        probs = (probs + ensemble_prob) / 2.
     max_probs, idx = probs.max(dim=-1)
     return idx, max_probs, probs
 

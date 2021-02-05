@@ -19,6 +19,7 @@ from fairseq import pybleu, options, progress_bar, tasks, tokenizer, utils, stra
 from fairseq.meters import TimeMeter
 from fairseq.strategies.strategy_utils import duplicate_encoder_out
 
+PRETRAINED_PATH = ""
 
 def main(args, checkpoint_name="best"):
     assert args.path is not None, '--path required for generation!'
@@ -38,6 +39,7 @@ def main(args, checkpoint_name="best"):
     task = tasks.setup_task(args)
     task.load_dataset(args.gen_subset)
     print('| {} {} {} examples'.format(args.data, args.gen_subset, len(task.dataset(args.gen_subset))))
+    args.taskobj = task
 
     # Set dictionaries
     #src_dict = task.source_dictionary
@@ -169,7 +171,6 @@ def main(args, checkpoint_name="best"):
                             results.append((target_str, hypo_str))
 
                     num_sentences += 1
-
         if has_target:
             print('Time = {}'.format(timer.elapsed_time))
             ref, out = zip(*results)
@@ -191,6 +192,8 @@ def generate_batched_itr(data_itr, strategy, models, tgt_dict, length_beam_size=
             cuda: use GPU for generation
     """
     for sample in data_itr:
+        if sample["net_input"]["src_tokens"].shape[1] < 10:
+            continue
         s = utils.move_to_cuda(sample) if cuda else sample
         if 'net_input' not in s:
             continue
@@ -262,6 +265,7 @@ if __name__ == '__main__':
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--stepwise", action="store_true")
     parser.add_argument("--scan-checkpoints", action="store_true")
+    parser.add_argument("--ensemble", action="store_true")
     parser.add_argument("--end-iteration", default=-1, type=int)
     args = options.parse_args_and_arch(parser)
     if args.all:

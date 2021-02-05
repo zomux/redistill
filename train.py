@@ -142,7 +142,7 @@ def main(args, init_distributed=False):
     valid_losses = [None]
     valid_subsets = args.valid_subset.split(',')
     if hasattr(args, "progressive") and args.progressive:
-        for i in range(args.refinetot):
+        for i in range(args.refinetotif if not getattr(args, "pnet", False) else args.refinetot - 1):
             print("validating for refine step", i)
             validate(args, trainer, task, epoch_itr, valid_subsets, force_refine_step=i)
         print("---")
@@ -421,6 +421,10 @@ def cli_main():
     parser.add_argument("--load", default="", type=str)
     parser.add_argument("--masking", action="store_true")
     args = options.parse_args_and_arch(parser)
+
+    if getattr(args, "pnet", False) and args.load == "":
+        print("training pnet requires loading a pretrained model")
+        sys.exit()
 
     if args.distributed_init_method is None:
         distributed_utils.infer_init_method(args)

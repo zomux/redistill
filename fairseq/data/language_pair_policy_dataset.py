@@ -87,7 +87,8 @@ class LanguagePairSelfDatasetPolicy(FairseqDataset):
         mask_range=False,
         train=True,
         seed=None,
-        progressive=False
+        progressive=False,
+        pnet=False
     ):
         if tgt_dict is not None:
             assert src_dict.pad() == tgt_dict.pad()
@@ -113,6 +114,7 @@ class LanguagePairSelfDatasetPolicy(FairseqDataset):
         self.seed = seed
         self.progressive = progressive
         self.random_refine_step = 0
+        self.pnet = pnet
         self.max_refine_step = 0
 
     def __getitem__(self, index):
@@ -127,7 +129,7 @@ class LanguagePairSelfDatasetPolicy(FairseqDataset):
         if force_refine_step is not None:
             self.random_refine_step = force_refine_step
         else:
-            self.random_refine_step = self.random.randint(max_step)
+            self.random_refine_step = self.random.randint(max_step if not self.pnet else max_step - 1)
 
     def _make_source_target(self, source, target):
         if self.dynamic_length:

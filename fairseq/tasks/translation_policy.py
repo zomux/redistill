@@ -188,7 +188,8 @@ class TranslationPolicyTask(FairseqTask):
             mask_range=self.args.mask_range,
             train=train,
             seed=seed,
-            progressive=hasattr(self.args, "progressive") and self.args.progressive
+            progressive=hasattr(self.args, "progressive") and self.args.progressive,
+            pnet=getattr(self.args, "pnet", False)
         )
 
     def max_positions(self):
