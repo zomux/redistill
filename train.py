@@ -142,7 +142,7 @@ def main(args, init_distributed=False):
     valid_losses = [None]
     valid_subsets = args.valid_subset.split(',')
     if hasattr(args, "progressive") and args.progressive:
-        for i in range(args.refinetotif if not getattr(args, "pnet", False) else args.refinetot - 1):
+        for i in range(args.refinetot if not getattr(args, "pnet", False) else args.refinetot - 1):
             print("validating for refine step", i)
             validate(args, trainer, task, epoch_itr, valid_subsets, force_refine_step=i)
         print("---")
@@ -419,6 +419,7 @@ def cli_main():
     parser.add_argument("--mask", action="store_true")
     parser.add_argument("--decoder-wise-training", action="store_true")
     parser.add_argument("--load", default="", type=str)
+    parser.add_argument("--focus", default=-1, type=int)
     parser.add_argument("--masking", action="store_true")
     args = options.parse_args_and_arch(parser)
 

@@ -38,7 +38,6 @@ class PolicyRewardCriterion(FairseqCriterion):
         parser.add_argument('--klreg', default=0, type=float)
         parser.add_argument("--sampling-temp", default=0.5, type=float)
         parser.add_argument("--offpolicy", action="store_true")
-        parser.add_argument("--fitbase", action="store_true")
         parser.add_argument("--tokenwise", action="store_true")
         parser.add_argument("--exposure1", action="store_true", help="refine during training")
         # fmt: on
@@ -111,9 +110,6 @@ class PolicyRewardCriterion(FairseqCriterion):
         if self.progressive:
             random_refine_step = sample["random_refine_step"]
             model.decoder.select_decoder(random_refine_step)
-        if getattr(self.args, "fitbase", False):
-            first_col = y_input[:, 0].clone().fill_(1)
-            y_input = torch.cat([first_col[:, None], y_input], 1)
         net_output = model.decoder(y_input, encoder_out=encoder_out)
         loss, reward, relative_reward, absreward = self.compute_loss(model, encoder_out, net_output, sample, reduce=reduce)
         sample_size = sample['target'].size(0)
@@ -139,13 +135,6 @@ class PolicyRewardCriterion(FairseqCriterion):
         cmlm_mask = (y_input == 4)
         true_target = sample["true_target"]
         logits = net_output[0]
-        if getattr(self.args, "fitbase", False):
-            if self.masker and model.decoder.selected_decoder > 0:
-                net_output[1]["sampled_mask"] = net_output[1]["sampled_mask"][:, 1:]
-                net_output[1]["masking_prob"] = net_output[1]["masking_prob"][:, 1:]
-            logits = logits[:, 1:]
-            baseline_states = net_output[1]["inner_states"][-1][0, :, :]
-            baseline_pred = model.decoder.baseline_nn(baseline_states)[:, 0]
 
         if getattr(self.args, "pnet", False):
             # Training the confidence prediction network
@@ -191,18 +180,15 @@ class PolicyRewardCriterion(FairseqCriterion):
         else:
             y_pred = y_pred * cmlm_mask + y_input * cmlm_mask.logical_not()
         # >>>>>> Compute baseline >>>>>>>>
-        if getattr(self.args, "fitbase", False):
-            baseline_reward = baseline_pred
+        if self.masker and model.decoder.selected_decoder > 0:
+            baseline_ypred = y_input.detach()
         else:
-            if self.masker and model.decoder.selected_decoder > 0:
-                baseline_ypred = y_input.detach()
-            else:
-                with torch.no_grad():
-                    baseline_logits = self.task.baseline_model().decoder(y_input, encoder_out=encoder_out)[0]
-                    # baseline_log_probs = torch.log_softmax(baseline_logits / self.args.sampling_temp, 2)
-                    baseline_ypred = baseline_logits.argmax(2)
-                    baseline_ypred = baseline_ypred * cmlm_mask + y_input * cmlm_mask.logical_not()
-            baseline_reward = self.compute_reward(baseline_ypred * y_mask, true_target * y_mask)
+            with torch.no_grad():
+                baseline_logits = self.task.baseline_model().decoder(y_input, encoder_out=encoder_out)[0]
+                # baseline_log_probs = torch.log_softmax(baseline_logits / self.args.sampling_temp, 2)
+                baseline_ypred = baseline_logits.argmax(2)
+                baseline_ypred = baseline_ypred * cmlm_mask + y_input * cmlm_mask.logical_not()
+        baseline_reward = self.compute_reward(baseline_ypred * y_mask, true_target * y_mask)
 
         # >>>>>> Obtain sample >>>>>>>>
         B, T, _ = probs.shape
@@ -215,32 +201,27 @@ class PolicyRewardCriterion(FairseqCriterion):
         absreward = self.compute_reward(y_pred * y_mask, true_target * y_mask)
         reward = absreward - baseline_reward
         relative_reward = sample_reward - baseline_reward
-        # >>>>>> Compute loss signal >>>>>>>>
-        if getattr(self.args, "fitbase", False) and model.training and (self.training_cnt < 100 or self.training_cnt % 5 == 0):
-            baseline_loss = (sample_reward.detach() - baseline_pred) ** 2
-            loss = baseline_loss
         # >>>>>> Only for on-policy training >>>>>>>>
+        if self.args.tokenwise:
+            reward = reward / cmlm_mask.sum(1)
+            relative_reward = relative_reward / cmlm_mask.sum(1)
+            loss = (- relative_reward[:, None] * logp_mat * cmlm_mask).sum(1) / cmlm_mask.sum(1) # + self.args.klreg * kldiv / cmlm_mask.sum(1)
         else:
-            if self.args.tokenwise:
-                reward = reward / cmlm_mask.sum(1)
-                relative_reward = relative_reward / cmlm_mask.sum(1)
-                loss = (- relative_reward[:, None] * logp_mat * cmlm_mask).sum(1) / cmlm_mask.sum(1) # + self.args.klreg * kldiv / cmlm_mask.sum(1)
-            else:
-                if self.masker:
-                    if getattr(self.args, "masker_hard", False) and model.decoder.selected_decoder > 0:
-                        sampled_mask = net_output[1]["sampled_mask"]
-                        logp = (logp_mat * sampled_mask * y_mask).sum(1)
-                    else:
-                        logp = (logp_mat * y_mask).sum(1)
-
-                else:
-                    logp = (logp_mat * cmlm_mask).sum(1)
-                loss = - relative_reward * logp # + self.args.klreg * kldiv
+            if self.masker:
                 if getattr(self.args, "masker_hard", False) and model.decoder.selected_decoder > 0:
-                    masking_prob = net_output[1]["masking_prob"]
-                    log_maskp_mat = torch.log(masking_prob)
-                    log_maskp = (log_maskp_mat * y_mask).sum(1)
-                    loss += - relative_reward * log_maskp
+                    sampled_mask = net_output[1]["sampled_mask"]
+                    logp = (logp_mat * sampled_mask * y_mask).sum(1)
+                else:
+                    logp = (logp_mat * y_mask).sum(1)
+
+            else:
+                logp = (logp_mat * cmlm_mask).sum(1)
+            loss = - relative_reward * logp # + self.args.klreg * kldiv
+            if getattr(self.args, "masker_hard", False) and model.decoder.selected_decoder > 0:
+                masking_prob = net_output[1]["masking_prob"]
+                log_maskp_mat = torch.log(masking_prob)
+                log_maskp = (log_maskp_mat * y_mask).sum(1)
+                loss += - relative_reward * log_maskp
 
         if reduce:
             loss = loss.sum()
