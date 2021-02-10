@@ -25,7 +25,7 @@ class PolicyRewardCriterion(FairseqCriterion):
             from fairseq.strategies.mask_predict import MaskPredict
             args.end_iteration = -1
             args.decoding_iterations = args.refinetot
-            self.strategy = MaskPredict(args, exit_after_mask=False if self.masker else True)
+            self.strategy = MaskPredict(args, exit_after_mask=False if self.masker or getattr(args, "pnet2", False) else True)
         else:
             self.strategy = None
         assert not args.offpolicy
@@ -91,6 +91,56 @@ class PolicyRewardCriterion(FairseqCriterion):
             model.train()
         return out_tokens
 
+    def compute_pnet_loss(self, model, encoder_out, y_input, sample, reduce=False):
+        y_input = sample["net_input"]["prev_output_tokens"]
+        y_mask = (y_input != 1)
+        cmlm_mask = (y_input == 4)
+        true_target = sample["true_target"]
+        h, decoder_padding_mask, decoder_out = model.decoder.compute_pnet_firsthalf(y_input)
+        pnet_out = decoder_out["pnet_out"]
+        p_prob = torch.sigmoid(pnet_out)
+        dist = torch.distributions.bernoulli.Bernoulli(p_prob)
+        if model.training:
+            p_sample = dist.sample()
+        else:
+            p_sample = torch.gt(p_prob, 0.5).int()
+        p_logp = dist.log_prob(p_sample)
+        mask = p_sample
+
+        logits = model.decoder.compute_pnet_secondhalf(h, decoder_padding_mask, mask, encoder_out)
+        from lib_nsmldebug import set_trace
+        set_trace()
+
+        # Training the confidence prediction network
+        pnet_out = net_output[1]["pnet_out"]
+        dist = torch.distributions.normal.Normal(pnet_out, 1.)
+        if not model.training:
+            sampled_p = pnet_out
+        else:
+            sampled_p = dist.sample()
+        p_logp = dist.log_prob(sampled_p)
+        t = sample["random_refine_step"]
+        tokens_t = logits.argmax(2)
+        tokens_t = tokens_t * y_mask + y_input * y_mask.logical_not()
+        masked_tokens_t = tokens_t.clone()
+        self.strategy.remask(masked_tokens_t, sampled_p, t + 1, self.args.refinetot)
+        with torch.no_grad():
+            model.decoder.select_decoder(t + 1)
+            next_logits = model.decoder(masked_tokens_t, encoder_out=encoder_out)[0]
+        next_tokens = next_logits.argmax(2)
+        next_tokens = next_tokens * y_mask + y_input * y_mask.logical_not()
+        next_absreward = self.compute_reward(next_tokens * y_mask, true_target * y_mask)
+        baseline_reward = self.compute_reward(tokens_t * y_mask, true_target * y_mask)
+        relative_reward = next_absreward - baseline_reward
+        logp = (p_logp * y_mask).sum(1)
+        loss = - relative_reward * logp
+        if reduce:
+            loss = loss.sum()
+            relative_reward = relative_reward.sum()
+            next_absreward = next_absreward.sum()
+        return loss, relative_reward, relative_reward, next_absreward
+
+
     def forward(self, model, sample, reduce=True):
         """Compute the loss for the given sample.
 
@@ -110,8 +160,12 @@ class PolicyRewardCriterion(FairseqCriterion):
         if self.progressive:
             random_refine_step = sample["random_refine_step"]
             model.decoder.select_decoder(random_refine_step)
-        net_output = model.decoder(y_input, encoder_out=encoder_out)
-        loss, reward, relative_reward, absreward = self.compute_loss(model, encoder_out, net_output, sample, reduce=reduce)
+        if getattr(self.args, "pnet2", False):
+            loss, reward, relativer_eward, absreward = self.compute_pnet_loss(model, encoder_out, y_input, sample, reduce=reduce)
+
+        else:
+            net_output = model.decoder(y_input, encoder_out=encoder_out)
+            loss, reward, relative_reward, absreward = self.compute_loss(model, encoder_out, net_output, sample, reduce=reduce)
         sample_size = sample['target'].size(0)
         logging_output = {
             'loss': utils.item(loss.data) if reduce else loss.data,

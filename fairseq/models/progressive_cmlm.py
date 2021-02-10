@@ -123,7 +123,7 @@ class Transformer_nonautoregressive(FairseqModel):
         parser.add_argument("--masker-hard", action="store_true", help="token masking model")
         parser.add_argument("--light", action="store_true", help="train only the last decoder layer")
         parser.add_argument("--pnet", action="store_true", help="pnet")
-        parser.add_argument("--pnet-arch2", action="store_true", help="pnet")
+        parser.add_argument("--pnet2", action="store_true", help="pnet")
         parser.add_argument("--refinestep", default=0, type=int)
         parser.add_argument("--refinetot", default=0, type=int)
 
@@ -230,6 +230,8 @@ class ProgressiveSelfTransformerDecoder(FairseqIncrementalDecoder):
         self.masker = masker
         self.pnet = getattr(args, "pnet", False)
         self.pnet2 = getattr(args, "pnet2", False)
+        if self.pnet2:
+            assert not self.light
         self.dropout = args.dropout
         self.share_input_output_embed = args.share_decoder_input_output_embed
 
@@ -284,8 +286,13 @@ class ProgressiveSelfTransformerDecoder(FairseqIncrementalDecoder):
                     TransformerDecoderLayer(args, no_encoder_attn)
                     for _ in range(3)
                 ])
-        if self.pnet or self.pnet2:
             self.pnet_pred = nn.Linear(self.embed_dim, 1)
+
+        if self.pnet2:
+            self.pnet_stack = nn.ModuleList()
+            self.pnet_stack.extend([
+                nn.Linear(self.embed_dim, 1) for _ in range(args.decoder_layers)
+            ])
 
         if self.masker:
             self.masker_stack = nn.ModuleList()
@@ -375,6 +382,58 @@ class ProgressiveSelfTransformerDecoder(FairseqIncrementalDecoder):
         from lib_nsmldebug import set_trace
         set_trace()
         return sample, logp
+
+    def compute_pnet_firsthalf(self, y_input, encoder_out=None):
+        decoder_padding_mask = y_input.eq(self.padding_idx)
+        # embed positions
+        positions = self.embed_positions(
+            y_input,
+        ) if self.embed_positions is not None else None
+
+        # embed tokens and positions
+        x = self.embed_tokens(y_input)
+        if positions is not None:
+            x += positions
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1)
+        attn = None
+        inner_states = [x]
+
+        decoder_layers = self.layer_stack[self.selected_decoder]
+        # decoder layers
+        for layer in decoder_layers[:3]:
+            x, attn = layer(
+                x,
+                encoder_out['encoder_out'] if encoder_out is not None else None,
+                encoder_out['encoder_padding_mask'] if encoder_out is not None else None,
+                decoder_padding_mask,
+            )
+            inner_states.append(x)
+        # if self.normalize:
+        #     x = self.layer_norm(x)
+        # T x B x C -> B x T x C
+        x = x.transpose(0, 1)
+        # print("xh", x[-1])
+        pnet_out = self.pnet_stack[self.selected_decoder](x).sum(2)
+
+        decoder_out_dict = {'predicted_lengths': encoder_out['predicted_lengths'], "pnet_out": pnet_out}
+        last_h = x
+        return last_h, decoder_padding_mask, decoder_out_dict
+
+    def compute_pnet_secondhalf(self, h, decoder_padding_mask, cmlm_mask, encoder_out):
+        x = h.transpose(0, 1)
+        decoder_layers = self.layer_stack[self.selected_decoder]
+        for layer in decoder_layers[3:]:
+            x, attn = layer(
+                x,
+                encoder_out['encoder_out'] if encoder_out is not None else None,
+                encoder_out['encoder_padding_mask'] if encoder_out is not None else None,
+                decoder_padding_mask,
+            )
+        last_h = x.transpose(0, 1)
+        logits = self.compute_logits(last_h)
+        return logits
 
     def forward(self, prev_output_tokens, encoder_out=None, incremental_state=None, compute_logits=True):
         """
