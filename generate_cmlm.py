@@ -62,6 +62,16 @@ def main(args, checkpoint_name="best"):
             print("loaded")
         nsml.load(checkpoint_name, load_fn=load, session=session)
         models = [model.cuda()]
+    elif args.path == "pretrain":
+        from nsml import DATASET_PATH
+        from fairseq import checkpoint_utils
+        data_token = "en-de"
+        pretrained_path = "{}/train/pretrained_models/maskPredict_{}/checkpoint_best.pt".format(DATASET_PATH, data_token.split(".")[-1].replace("-", "_"))
+        print("| loading", pretrained_path)
+        model = task.build_model(args)
+        state = checkpoint_utils.load_checkpoint_to_cpu(pretrained_path)
+        model.load_state_dict(state["model"], strict=True)
+        models = [model.cuda()]
     elif args.path.startswith("wb://"):
         print("| loading wb checkpoint", args.path)
         import wandb
@@ -262,6 +272,7 @@ if __name__ == '__main__':
     options.add_model_args(parser)
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--stepwise", action="store_true")
+    parser.add_argument("--semiat", action="store_true")
     parser.add_argument("--scan-checkpoints", action="store_true")
     parser.add_argument("--ensemble", action="store_true")
     parser.add_argument("--end-iteration", default=-1, type=int)

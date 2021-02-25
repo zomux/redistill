@@ -80,17 +80,18 @@ def main(args, init_distributed=False):
 
     # Load pre-trained model
     data_token = args.data[0].split("/")[-1]
-    pretrained_path = "{}/train/pretrained_models/maskPredict_{}/checkpoint_best.pt".format(DATASET_PATH, data_token.split(".")[-1].replace("-", "_"))
-    if not HAS_NSML:
-        pretrained_path = pretrained_path.replace("/train", "")
-    print("| loading", pretrained_path)
-    state = checkpoint_utils.load_checkpoint_to_cpu(pretrained_path)
-    model.load_state_dict(state["model"], strict=True)
-    baseline_model = task.build_model(args)
-    baseline_model.load_state_dict(state["model"], strict=True)
-    if torch.cuda.is_available():
-        baseline_model.cuda()
-    task.set_baseline_model(baseline_model)
+    if "bert" in args.arch:
+        pretrained_path = "{}/train/pretrained_models/maskPredict_{}/checkpoint_best.pt".format(DATASET_PATH, data_token.split(".")[-1].replace("-", "_"))
+        if not HAS_NSML:
+            pretrained_path = pretrained_path.replace("/train", "")
+        print("| loading", pretrained_path)
+        state = checkpoint_utils.load_checkpoint_to_cpu(pretrained_path)
+        model.load_state_dict(state["model"], strict=True)
+        baseline_model = task.build_model(args)
+        baseline_model.load_state_dict(state["model"], strict=True)
+        if torch.cuda.is_available():
+            baseline_model.cuda()
+        task.set_baseline_model(baseline_model)
 
     if not args.masking and HAS_NSML:
         def nsml_bind(model):
@@ -111,7 +112,12 @@ def main(args, init_distributed=False):
     if args.load:
         print("loading model from session", args.load)
         session = args.load.replace("nsml://", "")
-        nsml.load("best", session=session)
+        if session.endswith(".pt"):
+            session, model_name = session.rsplit("/", 1)
+            model_name = model_name.replace(".pt", "")
+        else:
+            model_name = "best"
+        nsml.load(model_name, session=session)
 
     # Prepare for decoder wise training
     if args.decoder_wise_training:
@@ -163,7 +169,12 @@ def main(args, init_distributed=False):
 
         # save checkpoint
         if epoch_itr.epoch % args.save_interval == 0:
-            checkpoint_utils.save_checkpoint(args, trainer, epoch_itr, valid_losses[0])
+            if HAS_NSML:
+                if distributed_utils.is_master(args):
+                    print("nsml save for epoch", epoch_itr.epoch)
+                    nsml.save("epoch{}".format(epoch_itr.epoch))
+            else:
+                checkpoint_utils.save_checkpoint(args, trainer, epoch_itr, valid_losses[0])
 
         if ':' in getattr(args, 'data', ''):
             # sharded data: get train iterator for next epoch
@@ -319,13 +330,18 @@ def validate(args, trainer, task, epoch_itr, subsets, force_refine_step=None):
     """Evaluate the model on the validation set(s) and return the losses."""
     valid_random = np.random.RandomState(3)
     valid_task_random = np.random.RandomState(3)
+    if not hasattr(task, "random"):
+        task.random = None
     task_random_bak = task.random
     task.random = valid_task_random
     valid_losses = []
     for subset in subsets:
         # Initialize data iterator
         dataset = task.dataset(subset)
-        random_bak = dataset.random
+        if hasattr(dataset, "random"):
+            random_bak = dataset.random
+        else:
+            random_bak = None
         dataset.random = valid_random
         itr = task.get_batch_iterator(
             dataset=dataset,

@@ -30,10 +30,11 @@ from .bert_seq2seq import BertLayerNorm, TransformerEncoder, PositionalEmbedding
 
 @register_model('bert_transformer_seq2seq')
 class Transformer_nonautoregressive(FairseqModel):
-    def __init__(self, encoder, decoder, progressive=False, light=False, masker=False):
+    def __init__(self, encoder, decoder, progressive=False, light=False, masker=False, args=None):
         self.progressive = progressive
         self.light = light
         self.masker = True
+        self.args = args
         super().__init__(encoder, decoder)
         self.apply(self.init_bert_weights)
 
@@ -184,12 +185,21 @@ class Transformer_nonautoregressive(FairseqModel):
         else:
             decoder = SelfTransformerDecoder(args, tgt_dict, decoder_embed_tokens, args.decoder_embed_scale)
         progressive = hasattr(args, "progressive") and args.progressive
-        return Transformer_nonautoregressive(encoder, decoder, progressive=progressive, light=light, masker=masker)
+        return Transformer_nonautoregressive(encoder, decoder, progressive=progressive, light=light, masker=masker, args=args)
 
     def load_state_dict(self, state_dict, strict=True):
         if self.masker:
             strict = False
-        if self.progressive:
+        if self.progressive and getattr(self.args, "focus", -1) >= 0 and "layer_stack" in " ".join(state_dict.keys()):
+            strict = False
+            # Loading a previous model
+            keys = list(state_dict.keys())
+            for key in keys:
+                if key.startswith("decoder.layer_stack."):
+                    layer_idx = int(key.replace("decoder.layer_stack.", "")[0])
+                    if layer_idx >= getattr(self.args, "focus", -1):
+                        del state_dict[key]
+        elif self.progressive:
             keys = list(state_dict.keys())
             for key in keys:
                 if self.light:
@@ -379,8 +389,6 @@ class ProgressiveSelfTransformerDecoder(FairseqIncrementalDecoder):
         else:
             sample = torch.gt(masking_prob > 0.5).int()
         logp = dist.log_prob(sample)
-        from lib_nsmldebug import set_trace
-        set_trace()
         return sample, logp
 
     def compute_pnet_firsthalf(self, y_input, encoder_out=None):
@@ -421,7 +429,8 @@ class ProgressiveSelfTransformerDecoder(FairseqIncrementalDecoder):
         last_h = x
         return last_h, decoder_padding_mask, decoder_out_dict
 
-    def compute_pnet_secondhalf(self, h, decoder_padding_mask, cmlm_mask, encoder_out):
+    def compute_pnet_secondhalf(self, h, decoder_padding_mask, cmlm_mask, encoder_out, compute_logits=True):
+        h = h * (1.0 - cmlm_mask)[:, :, None]
         x = h.transpose(0, 1)
         decoder_layers = self.layer_stack[self.selected_decoder]
         for layer in decoder_layers[3:]:
@@ -432,7 +441,10 @@ class ProgressiveSelfTransformerDecoder(FairseqIncrementalDecoder):
                 decoder_padding_mask,
             )
         last_h = x.transpose(0, 1)
-        logits = self.compute_logits(last_h)
+        if compute_logits:
+            logits = self.compute_logits(last_h)
+        else:
+            logits = last_h
         return logits
 
     def forward(self, prev_output_tokens, encoder_out=None, incremental_state=None, compute_logits=True):

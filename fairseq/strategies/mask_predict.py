@@ -47,6 +47,30 @@ class MaskPredict(DecodingStrategy):
         assign_single_value_long(tokens, mask_ind, 4)
         assign_single_value_byte(tokens, pad_mask, 1)
 
+    def generate_pnet2(self, model, encoder_out, tgt_tokens, token_probs, tgt_dict):
+        token_logp = torch.log(token_probs)
+        for counter in range(1, self.iterations):
+            model.decoder.select_decoder(counter)
+            h, decoder_padding_mask, decoder_out = model.decoder.compute_pnet_firsthalf(tgt_tokens, encoder_out)
+            pnet_out = decoder_out["pnet_out"]
+            mask = torch.sigmoid(pnet_out)
+            logits = model.decoder.compute_pnet_secondhalf(h, decoder_padding_mask, mask, encoder_out)
+            probs = torch.softmax(logits / 0.5, 2).clamp(min=1e-8, max=1.)
+            input_onehot = torch.nn.functional.one_hot(tgt_tokens, logits.shape[2])
+            combined_probs = mask[:, :, None] * probs + (1 - mask[:, :, None]) * input_onehot
+            combined_probs = combined_probs.clamp(min=1e-8, max=1.)
+            B, T, _ = combined_probs.shape
+            y_pred = combined_probs.argmax(2)
+            change_mask = torch.ne(y_pred, tgt_tokens)
+            tgt_tokens = tgt_tokens * decoder_padding_mask + y_pred * decoder_padding_mask.logical_not()
+            log_dist = torch.log(combined_probs)
+            logp_mat = log_dist.view(B*T, -1)[torch.arange(B*T), tgt_tokens.flatten()].view(B, T)
+            token_logp += logp_mat * change_mask
+            logp = (token_logp * decoder_padding_mask.logical_not()).sum(-1)
+            if self.end_iteration != -1 and self.end_iteration == counter:
+                break
+        return tgt_tokens, logp
+
 
     def generate(self, model, encoder_out, tgt_tokens, tgt_dict, return_token_probs=False):
         bsz, seq_len = tgt_tokens.size()
@@ -61,21 +85,29 @@ class MaskPredict(DecodingStrategy):
         assign_single_value_byte(tgt_tokens, pad_mask, tgt_dict.pad())
         assign_single_value_byte(token_probs, pad_mask, 999.0)
         # print("Initialization: ", convert_tokens(tgt_dict, tgt_tokens[9]))
+        if getattr(self.args, "pnet2", False) and (self.end_iteration == -1 or self.end_iteration > 0):
+            return self.generate_pnet2(model, encoder_out, tgt_tokens, token_probs, tgt_dict)
         for counter in range(1, iterations):
             if self.end_iteration != -1 and counter > self.end_iteration and not self.exit_after_mask:
                 break
             num_mask = (seq_lens.float() * (1.0 - (counter / iterations))).long()
 
-            if not self.masker:
-                assign_single_value_byte(token_probs, pad_mask, 999.0)
-                mask_ind = self.select_worst(token_probs, num_mask)
-                assign_single_value_long(tgt_tokens, mask_ind, tgt_dict.mask())
+            if getattr(self.args, "semiat", False):
+                percent_mask = torch.arange(tgt_tokens.shape[1]).cuda().float()[None, :] / seq_lens[:, None]
+                keep_mask = (percent_mask <= counter / iterations)
+                assign_single_value_byte(tgt_tokens, keep_mask.logical_not(), 4)
+                mask_ind = keep_mask.logical_not() * pad_mask.logical_not()
+            elif not self.masker:
+                    assign_single_value_byte(token_probs, pad_mask, 999.0)
+                    mask_ind = self.select_worst(token_probs, num_mask)
+                    assign_single_value_long(tgt_tokens, mask_ind, tgt_dict.mask())
             assign_single_value_byte(tgt_tokens, pad_mask, tgt_dict.pad())
 
             if self.end_iteration != -1 and counter > self.end_iteration and self.exit_after_mask:
                 break
             # print("Step: ", counter+1)
             # print("Masking: ", convert_tokens(tgt_dict, tgt_tokens[9]))
+
             if self.progressive:
                 model.decoder.select_decoder(counter)
             decoder_out = model.decoder(tgt_tokens, encoder_out)
@@ -95,13 +127,16 @@ class MaskPredict(DecodingStrategy):
                 tgt_tokens = probs.argmax(2)
             else:
                 new_tgt_tokens, new_token_probs, all_token_probs = generate_step_with_prob(decoder_out, ensemble_prob=baseline_prob)
-                if getattr(self.args, "pnet", False):
-                    token_probs = decoder_out[1]["pnet_out"]
+                if getattr(self.args, "semiat", False):
+                    tgt_tokens = new_tgt_tokens * mask_ind + tgt_tokens * mask_ind.logical_not()
+                    token_probs = new_token_probs * mask_ind + token_probs * mask_ind.logical_not()
                 else:
-                    assign_multi_value_long(token_probs, mask_ind, new_token_probs)
-                assign_single_value_byte(token_probs, pad_mask, 999.0)
-
-                assign_multi_value_long(tgt_tokens, mask_ind, new_tgt_tokens)
+                    if getattr(self.args, "pnet", False):
+                        token_probs = decoder_out[1]["pnet_out"]
+                    else:
+                        assign_multi_value_long(token_probs, mask_ind, new_token_probs)
+                    assign_single_value_byte(token_probs, pad_mask, 999.0)
+                    assign_multi_value_long(tgt_tokens, mask_ind, new_tgt_tokens)
             assign_single_value_byte(tgt_tokens, pad_mask, tgt_dict.pad())
             # print("Prediction: ", convert_tokens(tgt_dict, tgt_tokens[9]))
             if counter == self.end_iteration and not self.exit_after_mask:
