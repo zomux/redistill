@@ -8,11 +8,14 @@
 import torch
 import numpy as np
 import math
+import sys
 
 from fairseq import utils
 
 from . import FairseqCriterion, register_criterion
 from .lib_sbleu import smoothed_bleu
+
+SHARD_SIZE = 20
 
 
 def label_smoothed_nll_loss(lprobs, target, epsilon, ignore_index=None, reduce=True):
@@ -63,7 +66,20 @@ class RewardCrossEntropyCriterion(FairseqCriterion):
         # >>>> Sample for reward >>>
         is_training = model.training
         model.eval()
-        gen_results = [[p["tokens"] for p in results] for results in self.gen.generate([model], sample)]
+        B = sample["target"].shape[0]
+        gen_results = []
+        for shard_i in range(math.ceil(float(B) / SHARD_SIZE)):
+            start = shard_i * SHARD_SIZE
+            end = (shard_i + 1) * SHARD_SIZE
+            sub_sample = {
+                "net_input": {
+                    "src_tokens": sample["net_input"]["src_tokens"][start:end],
+                    "src_lengths": sample["net_input"]["src_lengths"][start:end],
+                    "prev_output_tokens": sample["net_input"]["prev_output_tokens"][start:end]
+                }
+            }
+            sub_results = [[p["tokens"] for p in results] for results in self.gen.generate([model], sub_sample)]
+            gen_results.extend(sub_results)
         targets = sample["target"] * torch.gt(sample["target"], 1)
         rewards = []
         for batch_i in range(len(gen_results)):
@@ -81,8 +97,8 @@ class RewardCrossEntropyCriterion(FairseqCriterion):
         first_col = new_target.new_ones(new_target.shape[0]) * 2
         sample["net_input"]["prev_output_tokens"] = torch.cat([ first_col[:, None], new_target[:, :-1] ], 1)
         sample["target"] = new_target
-        best_reward = rewards[torch.arange(rewards.shape[0]), best_idx]
-        argmax_reward = rewards[:, 0]
+        best_reward = rewards[torch.arange(rewards.shape[0]), best_idx].cuda()
+        argmax_reward = rewards[:, 0].cuda()
         if is_training:
             model.train()
         # >>>>
@@ -118,8 +134,8 @@ class RewardCrossEntropyCriterion(FairseqCriterion):
         return {
             'loss': sum(log.get('loss', 0) for log in logging_outputs) / sample_size / math.log(2) if sample_size > 0 else 0.,
             'nll_loss': sum(log.get('nll_loss', 0) for log in logging_outputs) / ntokens / math.log(2) if ntokens > 0 else 0.,
-            'best_r': sum(log.get('best_r', 0) for log in logging_outputs) / sample_size / math.log(2) if sample_size > 0 else 0.,
-            'argmax_r': sum(log.get('argmax_r', 0) for log in logging_outputs) / sample_size / math.log(2) if sample_size > 0 else 0.,
+            'best_r': sum(log.get('best_r', 0) for log in logging_outputs) / nsentences / math.log(2) if nsentences > 0 else 0.,
+            'argmax_r': sum(log.get('argmax_r', 0) for log in logging_outputs) / nsentences / math.log(2) if nsentences > 0 else 0.,
             'ntokens': ntokens,
             'nsentences': nsentences,
             'sample_size': sample_size,

@@ -10,10 +10,22 @@ Translate pre-processed data with a trained model.
 """
 
 import torch
+import numpy as np
+import os
+import sys
 
-from fairseq import bleu, checkpoint_utils, options, progress_bar, tasks, utils
+from fairseq import pybleu, checkpoint_utils, options, progress_bar, tasks, utils
 from fairseq.meters import StopwatchMeter, TimeMeter
+from fairseq.criterions.lib_sbleu import smoothed_bleu
 
+try:
+    import nsml
+    HAS_NSML = True
+except ImportError:
+    HAS_NSML = False
+
+def compute_reward(hypo_str, target_str):
+    return smoothed_bleu(hypo_str.split(), target_str.split())
 
 def main(args):
     assert args.path is not None, '--path required for generation!'
@@ -43,11 +55,48 @@ def main(args):
 
     # Load ensemble
     print('| loading model(s) from {}'.format(args.path))
-    models, _model_args = checkpoint_utils.load_model_ensemble(
-        args.path.split(':'),
-        arg_overrides=eval(args.model_overrides),
-        task=task,
-    )
+    if args.path.startswith("nsml://"):
+        session = args.path.replace("nsml://", "")
+        model = task.build_model(args)
+        if ".pt" in session:
+            session = session.replace(".pt", "")
+            session, checkpoint_name = session.rsplit("/", 1)
+        else:
+            checkpoint_name = "best"
+        if "-" in checkpoint_name:
+            start, end = checkpoint_name.replace("epoch", "").split("-")
+            checkpoints = ["epoch{}".format(i) for i in range(int(start), int(end) + 1)]
+            print("| checkpoint average:", checkpoints)
+            state_dict = None
+            def load(dir_path):
+                nonlocal state_dict, checkpoints
+                state = torch.load(os.path.join(dir_path, 'best.pt'))
+                model_state = state["model"]
+                for k in model_state:
+                    model_state[k] = model_state[k] / float(len(checkpoints))
+                if state_dict is None:
+                    state_dict = model_state
+                else:
+                    for k in state_dict:
+                        state_dict[k] += model_state[k]
+                print("checkpoint loaded")
+            for checkpoint_name in checkpoints:
+                nsml.load(checkpoint_name, load_fn=load, session=session)
+            model.load_state_dict(state_dict)
+        else:
+            def load(dir_path):
+                state = torch.load(os.path.join(dir_path, 'best.pt'))
+                state_dict = state["model"]
+                model.load_state_dict(state_dict)
+                print("loaded")
+            nsml.load(checkpoint_name, load_fn=load, session=session)
+        models = [model.cuda()]
+    else:
+        models, _model_args = checkpoint_utils.load_model_ensemble(
+            args.path.split(':'),
+            arg_overrides=eval(args.model_overrides),
+            task=task,
+        )
 
     # Optimize ensemble for generation
     for model in models:
@@ -85,12 +134,14 @@ def main(args):
     generator = task.build_generator(args)
 
     # Generate and compute BLEU score
-    if args.sacrebleu:
-        scorer = bleu.SacrebleuScorer()
-    else:
-        scorer = bleu.Scorer(tgt_dict.pad(), tgt_dict.eos(), tgt_dict.unk())
+    # if args.sacrebleu:
+    #     scorer = bleu.SacrebleuScorer()
+    # else:
+    #     scorer = bleu.Scorer(tgt_dict.pad(), tgt_dict.eos(), tgt_dict.unk())
+    scorer = pybleu.PyBleuScorer()
     num_sentences = 0
     has_target = True
+    results = []
     with progress_bar.build_progress_bar(args, itr) as t:
         wps_meter = TimeMeter()
         for sample in t:
@@ -134,42 +185,62 @@ def main(args):
                     if has_target:
                         print('T-{}\t{}'.format(sample_id, target_str))
 
-                # Process top predictions
-                for j, hypo in enumerate(hypos[i][:args.nbest]):
-                    hypo_tokens, hypo_str, alignment = utils.post_process_prediction(
-                        hypo_tokens=hypo['tokens'].int().cpu(),
-                        src_str=src_str,
-                        alignment=hypo['alignment'].int().cpu() if hypo['alignment'] is not None else None,
-                        align_dict=align_dict,
-                        tgt_dict=tgt_dict,
-                        remove_bpe=args.remove_bpe,
-                    )
+                if args.reward_sample:
+                    hypo_strs = []
+                    rewards = []
+                    for j, hypo in enumerate(hypos[i]):
+                        hypo_tokens, hypo_str, alignment = utils.post_process_prediction(
+                            hypo_tokens=hypo['tokens'].int().cpu(),
+                            src_str=src_str,
+                            alignment=None,
+                            align_dict=align_dict,
+                            tgt_dict=tgt_dict,
+                            remove_bpe=None,
+                        )
+                        hypo_str_nobpe = hypo_str.replace("@@ ", "")
+                        rewards.append(compute_reward(hypo_str_nobpe, target_str))
+                        hypo_strs.append(hypo_str)
+                    best_idx = np.array(rewards).argmax()
+                    print("{} | {}".format(sample_id, hypo_strs[best_idx]))
+                    sys.stdout.flush()
+                else:
+                    # Process top predictions
+                    for j, hypo in enumerate(hypos[i][:args.nbest]):
+                        hypo_tokens, hypo_str, alignment = utils.post_process_prediction(
+                            hypo_tokens=hypo['tokens'].int().cpu(),
+                            src_str=src_str,
+                            alignment=hypo['alignment'].int().cpu() if hypo['alignment'] is not None else None,
+                            align_dict=align_dict,
+                            tgt_dict=tgt_dict,
+                            remove_bpe=args.remove_bpe,
+                        )
 
-                    if not args.quiet:
-                        print('H-{}\t{}\t{}'.format(sample_id, hypo['score'], hypo_str))
-                        print('P-{}\t{}'.format(
-                            sample_id,
-                            ' '.join(map(
-                                lambda x: '{:.4f}'.format(x),
-                                hypo['positional_scores'].tolist(),
-                            ))
-                        ))
-
-                        if args.print_alignment:
-                            print('A-{}\t{}'.format(
+                        if not args.quiet:
+                            print('H-{}\t{}\t{}'.format(sample_id, hypo['score'], hypo_str))
+                            print('P-{}\t{}'.format(
                                 sample_id,
-                                ' '.join(map(lambda x: str(utils.item(x)), alignment))
+                                ' '.join(map(
+                                    lambda x: '{:.4f}'.format(x),
+                                    hypo['positional_scores'].tolist(),
+                                ))
                             ))
 
-                    # Score only the top hypothesis
-                    if has_target and j == 0:
-                        if align_dict is not None or args.remove_bpe is not None:
-                            # Convert back to tokens for evaluation with unk replacement and/or without BPE
-                            target_tokens = tgt_dict.encode_line(target_str, add_if_not_exist=True)
-                        if hasattr(scorer, 'add_string'):
-                            scorer.add_string(target_str, hypo_str)
-                        else:
-                            scorer.add(target_tokens, hypo_tokens)
+                            if args.print_alignment:
+                                print('A-{}\t{}'.format(
+                                    sample_id,
+                                    ' '.join(map(lambda x: str(utils.item(x)), alignment))
+                                ))
+
+                        # Score only the top hypothesis
+                        if has_target and j == 0 and not args.reward_sample:
+                            if align_dict is not None or args.remove_bpe is not None:
+                                # Convert back to tokens for evaluation with unk replacement and/or without BPE
+                                target_tokens = tgt_dict.encode_line(target_str, add_if_not_exist=True)
+                            results.append((target_str, hypo_str))
+                            # if hasattr(scorer, 'add_string'):
+                            #     scorer.add_string(target_str, hypo_str)
+                            # else:
+                            #     scorer.add(target_tokens, hypo_tokens)
 
             wps_meter.update(num_generated_tokens)
             t.log({'wps': round(wps_meter.avg)})
@@ -177,13 +248,17 @@ def main(args):
 
     print('| Translated {} sentences ({} tokens) in {:.1f}s ({:.2f} sentences/s, {:.2f} tokens/s)'.format(
         num_sentences, gen_timer.n, gen_timer.sum, num_sentences / gen_timer.sum, 1. / gen_timer.avg))
-    if has_target:
-        print('| Generate {} with beam={}: {}'.format(args.gen_subset, args.beam, scorer.result_string()))
+
+    if has_target and not args.reward_sample:
+        ref, out = zip(*results)
+        print('| Generate {} with beam={}: {}'.format(args.gen_subset, args.beam, scorer.score(ref, out)))
     return scorer
 
 
 def cli_main():
     parser = options.get_generation_parser()
+    options.add_model_args(parser)
+    parser.add_argument("--reward-sample", action="store_true")
     args = options.parse_args_and_arch(parser)
     main(args)
 

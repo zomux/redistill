@@ -12,6 +12,11 @@ import torch
 import os
 import re
 
+try:
+    from nsml import DATASET_PATH
+    HAS_NSML = True
+except ImportError:
+    HAS_NSML = False
 
 def average_checkpoints(inputs):
     """Loads checkpoints from inputs and returns a model with averaged weights.
