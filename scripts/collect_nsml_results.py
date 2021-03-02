@@ -16,7 +16,7 @@ for sess in args.sessions.split(","):
     for line in lines:
         if " | " in line:
             id, line = line.split(" | ")
-            results.append((id, line))
+            results.append((int(id), line))
 results.sort()
 with open(args.save, "w") as outf:
     for _, line in results:

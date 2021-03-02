@@ -111,13 +111,40 @@ def main(args, init_distributed=False):
 
     if args.load:
         print("loading model from session", args.load)
-        session = args.load.replace("nsml://", "")
-        if session.endswith(".pt"):
-            session, model_name = session.rsplit("/", 1)
-            model_name = model_name.replace(".pt", "")
+        if args.load.startswith("nsml://"):
+            session = args.load.replace("nsml://", "")
+        if ".pt" in session:
+            session = session.replace(".pt", "")
+            session, checkpoint_name = session.rsplit("/", 1)
         else:
-            model_name = "best"
-        nsml.load(model_name, session=session)
+            checkpoint_name = "best"
+        if "-" in checkpoint_name:
+            start, end = checkpoint_name.replace("epoch", "").split("-")
+            checkpoints = ["epoch{}".format(i) for i in range(int(start), int(end) + 1)]
+            print("| checkpoint average:", checkpoints)
+            state_dict = None
+            def load(dir_path):
+                nonlocal state_dict, checkpoints
+                state = torch.load(os.path.join(dir_path, 'best.pt'))
+                model_state = state["model"]
+                for k in model_state:
+                    model_state[k] = model_state[k] / float(len(checkpoints))
+                if state_dict is None:
+                    state_dict = model_state
+                else:
+                    for k in state_dict:
+                        state_dict[k] += model_state[k]
+                print("checkpoint loaded")
+            for checkpoint_name in checkpoints:
+                nsml.load(checkpoint_name, load_fn=load, session=session)
+            model.load_state_dict(state_dict)
+        else:
+            def load(dir_path):
+                state = torch.load(os.path.join(dir_path, 'best.pt'))
+                state_dict = state["model"]
+                model.load_state_dict(state_dict)
+                print("loaded")
+            nsml.load(checkpoint_name, load_fn=load, session=session)
 
     # Prepare for decoder wise training
     if args.decoder_wise_training:

@@ -20,4 +20,4 @@ dict = Dictionary.load(args.dict)
 print("len", len(index))
 with open(args.save, "w") as outf:
     for i in range(len(index)):
-        outf.write(dict.string(index[0] - 1) + "\n")
+        outf.write(dict.string(index[i] - 1) + "\n")
