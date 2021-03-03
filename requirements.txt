@@ -1,7 +1,15 @@
 #nsml: nsml/ml:cuda10.1-cudnn7-pytorch1.3keras2.3
+numpy==1.19.2
+dill<0.3
+msgpack<0.6.0
+wrapt<1.11.0
+six==1.15.0
 torchtext==0.4.0
 web-pdb
 line-profiler
 sacrebleu
 adamp
 prettytable
+tensorflow==2.3.0
+git+https://github.com/google-research/bleurt.git
+transformers

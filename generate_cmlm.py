@@ -9,6 +9,7 @@ Translate pre-processed data with a trained model.
 """
 
 import os
+import sys
 import torch
 import numpy as np
 import math
@@ -18,6 +19,8 @@ import re
 from fairseq import pybleu, options, progress_bar, tasks, tokenizer, utils, strategies
 from fairseq.meters import TimeMeter
 from fairseq.strategies.strategy_utils import duplicate_encoder_out
+from bleurt import score
+from transformers import cached_path
 
 PRETRAINED_PATH = ""
 
@@ -40,6 +43,22 @@ def main(args, checkpoint_name="best"):
     task.load_dataset(args.gen_subset)
     print('| {} {} {} examples'.format(args.data, args.gen_subset, len(task.dataset(args.gen_subset))))
     args.taskobj = task
+
+    sys.argv = sys.argv[:1]
+    import tensorflow as tf
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as e:
+            print(e)
+    bleurt_scorer = score.BleurtScorer(os.path.join(
+        cached_path(
+            "https://storage.googleapis.com/bleurt-oss/bleurt-base-128.zip",
+            extract_compressed_file=True
+        ), "bleurt-base-128"
+    ))
 
     # Set dictionaries
     #src_dict = task.source_dictionary
@@ -187,6 +206,8 @@ def main(args, checkpoint_name="best"):
             from fairseq.criterions.lib_sbleu import smoothed_bleu
             sbleu = np.mean([smoothed_bleu(p[0].split(), p[1].split()) for p in results])
             print("| SBLEU = {:.2f}".format(sbleu))
+            bleurt_scores = bleurt_scorer.score([p[0] for p in results], [p[1] for p in results])
+            print("| BLEURT = {:.4f}".format(np.mean((np.array(bleurt_scores)))))
             print('| Generate {} with beam={}: BLEU4 = {:2.2f}, '.format(args.gen_subset, args.length_beam, scorer.score(ref, out)))
 
 

@@ -17,6 +17,8 @@ import sys
 from fairseq import pybleu, checkpoint_utils, options, progress_bar, tasks, utils
 from fairseq.meters import StopwatchMeter, TimeMeter
 from fairseq.criterions.lib_sbleu import smoothed_bleu
+from bleurt import score
+from transformers import cached_path
 
 try:
     import nsml
@@ -41,6 +43,22 @@ def main(args):
     print(args)
 
     use_cuda = torch.cuda.is_available() and not args.cpu
+
+    sys.argv = sys.argv[:1]
+    import tensorflow as tf
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as e:
+            print(e)
+    bleurt_scorer = score.BleurtScorer(os.path.join(
+        cached_path(
+            "https://storage.googleapis.com/bleurt-oss/bleurt-base-128.zip",
+            extract_compressed_file=True
+        ), "bleurt-base-128"
+    ))
 
     # Load dataset splits
     task = tasks.setup_task(args)
@@ -142,6 +160,7 @@ def main(args):
     num_sentences = 0
     has_target = True
     results = []
+    best_rank_list = []
     with progress_bar.build_progress_bar(args, itr) as t:
         wps_meter = TimeMeter()
         for sample in t:
@@ -185,7 +204,7 @@ def main(args):
                     if has_target:
                         print('T-{}\t{}'.format(sample_id, target_str))
 
-                if args.reward_sample:
+                if args.reward_sample or args.reward_check:
                     hypo_strs = []
                     rewards = []
                     for j, hypo in enumerate(hypos[i]):
@@ -201,6 +220,8 @@ def main(args):
                         rewards.append(compute_reward(hypo_str_nobpe, target_str))
                         hypo_strs.append(hypo_str)
                     best_idx = np.array(rewards).argmax()
+                    if args.reward_check:
+                        best_rank_list.append(best_idx)
                     print("{} | {}".format(sample_id, hypo_strs[best_idx]))
                     sys.stdout.flush()
                 else:
@@ -249,8 +270,16 @@ def main(args):
     print('| Translated {} sentences ({} tokens) in {:.1f}s ({:.2f} sentences/s, {:.2f} tokens/s)'.format(
         num_sentences, gen_timer.n, gen_timer.sum, num_sentences / gen_timer.sum, 1. / gen_timer.avg))
 
-    if has_target and not args.reward_sample:
+    if args.reward_check:
+        print("avg ranking of the best sample:", np.array(best_rank_list).mean())
+        print("ratio of best sample ranked in the top:", (np.array(best_rank_list) == 0).mean())
+    if has_target and not args.reward_sample and not args.reward_check:
         ref, out = zip(*results)
+        from fairseq.criterions.lib_sbleu import smoothed_bleu
+        sbleu = np.mean([smoothed_bleu(p[0].split(), p[1].split()) for p in results])
+        print("| SBLEU = {:.2f}".format(sbleu))
+        bleurt_scores = bleurt_scorer.score([p[0] for p in results], [p[1] for p in results])
+        print("| BLEURT = {:.4f}".format(np.mean((np.array(bleurt_scores)))))
         print('| Generate {} with beam={}: {}'.format(args.gen_subset, args.beam, scorer.score(ref, out)))
     return scorer
 

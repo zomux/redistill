@@ -66,6 +66,12 @@ def main(args, init_distributed=False):
     # Build model and criterion
     model = task.build_model(args)
     criterion = task.build_criterion(args)
+
+    if args.train_decoder_only:
+        for name, param in model.named_parameters():
+            if "decoder" not in name:
+                param.requires_grad_(False)
+
     print(model)
     print('| model {}, criterion {}'.format(args.arch, criterion.__class__.__name__))
     print('| num. model params: {} (num. trained: {})'.format(
@@ -464,6 +470,7 @@ def cli_main():
     parser.add_argument("--load", default="", type=str)
     parser.add_argument("--focus", default=-1, type=int)
     parser.add_argument("--masking", action="store_true")
+    parser.add_argument("--train-decoder-only", action="store_true")
     args = options.parse_args_and_arch(parser)
 
     if getattr(args, "pnet", False) and args.load == "":
