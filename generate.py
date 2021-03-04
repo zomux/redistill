@@ -288,6 +288,7 @@ def cli_main():
     parser = options.get_generation_parser()
     options.add_model_args(parser)
     parser.add_argument("--reward-sample", action="store_true")
+    parser.add_argument("--reward", default="sbleu")
     parser.add_argument("--reward-check", action="store_true")
     args = options.parse_args_and_arch(parser)
     main(args)
