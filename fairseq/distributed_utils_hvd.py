@@ -16,7 +16,7 @@ import math
 import torch
 import torch.distributed as dist
 from torch import nn
-# import horovod.torch as hvd
+import horovod.torch as hvd
 
 from fairseq import utils
 
@@ -131,102 +131,44 @@ def all_reduce(tensor, group=None):
         group = get_default_group()
     return dist.all_reduce(tensor, group=group)
 
-
-def all_gather_list(data, group=None, max_size=16384):
-    """Gathers arbitrary data from all nodes into a list.
-
-    Similar to :func:`~torch.distributed.all_gather` but for arbitrary Python
-    data. Note that *data* must be picklable.
-
-    Args:
-        data (Any): data from the local worker to be gathered on other workers
-        group (optional): group of the collective
-        max_size (int, optional): maximum size of the data to be gathered
-            across workers
-    """
-    rank = get_rank()
-    world_size = get_world_size()
-
-    buffer_size = max_size * world_size
-    if not hasattr(all_gather_list, '_buffer') or \
-            all_gather_list._buffer.numel() < buffer_size:
-        all_gather_list._buffer = torch.cuda.ByteTensor(buffer_size)
-        all_gather_list._cpu_buffer = torch.ByteTensor(max_size).pin_memory()
-    buffer = all_gather_list._buffer
-    buffer.zero_()
-    cpu_buffer = all_gather_list._cpu_buffer
-
-    enc = pickle.dumps(data)
+def _encode(enc, max_size, use_max_size=False):
     enc_size = len(enc)
-    if enc_size + 2 > max_size:
-        raise ValueError('encoded data exceeds max_size: {}'.format(enc_size + 2))
-    assert max_size < 255*256
+    enc_byte = max(math.floor(math.log(max_size, 256)+1), 1)
+    if use_max_size:
+        # this is used for broadcasting
+        buffer_ = torch.ByteTensor(max_size+enc_byte)
+    else:
+        buffer_ = torch.ByteTensor(enc_size+enc_byte)
+    remainder = enc_size
+    for i in range(enc_byte):
+        base = 256 ** (enc_byte-i-1)
+        buffer_[i] = remainder // base
+        remainder %= base
+    buffer_[enc_byte:enc_byte+enc_size] = torch.ByteTensor(list(enc))
+    return buffer_, enc_byte
 
-    cpu_buffer[0] = enc_size // 255  # this encoding works for max_size < 65k
-    cpu_buffer[1] = enc_size % 255
-    cpu_buffer[2 : enc_size + 2] = torch.ByteTensor(list(enc))
-    start = rank * max_size
-    size = enc_size + 2
-    buffer[start : start + size].copy_(cpu_buffer[:size])
 
-    all_reduce(buffer, group=group)
+def _decode(buffer_, enc_byte):
+    size = sum(256 ** (enc_byte-i-1) * buffer_[i].item()
+               for i in range(enc_byte))
+    bytes_list = bytes(buffer_[enc_byte:enc_byte+size].tolist())
+    shift = size + enc_byte
+    return bytes_list, shift
 
-    try:
-        result = []
-        for i in range(world_size):
-            out_buffer = buffer[i * max_size : (i + 1) * max_size]
-            size = (255 * utils.item(out_buffer[0])) + utils.item(out_buffer[1])
-            if size > 0:
-                result.append(pickle.loads(bytes(out_buffer[2 : size + 2].tolist())))
-        return result
-    except pickle.UnpicklingError:
-        raise Exception(
-            'Unable to unpickle data from other workers. all_gather_list requires all '
-            'workers to enter the function together, so this error usually indicates '
-            'that the workers have fallen out of sync somehow. Workers can fall out of '
-            'sync if one of them runs out of memory, or if there are other conditions '
-            'in your training script that can cause one worker to finish an epoch '
-            'while other workers are still iterating over their portions of the data.'
-        )
+def all_gather_list(data, group=None, max_size=0):
+    """Gathers arbitrary data from all nodes into a list."""
+    enc = pickle.dumps(data)
 
-# def _encode(enc, max_size, use_max_size=False):
-#     enc_size = len(enc)
-#     enc_byte = max(math.floor(math.log(max_size, 256)+1), 1)
-#     if use_max_size:
-#         # this is used for broadcasting
-#         buffer_ = torch.ByteTensor(max_size+enc_byte)
-#     else:
-#         buffer_ = torch.ByteTensor(enc_size+enc_byte)
-#     remainder = enc_size
-#     for i in range(enc_byte):
-#         base = 256 ** (enc_byte-i-1)
-#         buffer_[i] = remainder // base
-#         remainder %= base
-#     buffer_[enc_byte:enc_byte+enc_size] = torch.ByteTensor(list(enc))
-#     return buffer_, enc_byte
-#
-#
-# def _decode(buffer_, enc_byte):
-#     size = sum(256 ** (enc_byte-i-1) * buffer_[i].item()
-#                for i in range(enc_byte))
-#     bytes_list = bytes(buffer_[enc_byte:enc_byte+size].tolist())
-#     shift = size + enc_byte
-#     return bytes_list, shift
-#
-# def all_gather_list(data, group=None, max_size=0):
-#     """Gathers arbitrary data from all nodes into a list."""
-#     enc = pickle.dumps(data)
-#
-#     enc_size = len(enc)
-#     max_size = hvd.allgather(torch.tensor([enc_size])).max().item()
-#     in_buffer, enc_byte = _encode(enc, max_size)
-#
-#     out_buffer = hvd.allgather(in_buffer[:enc_byte+enc_size])
-#
-#     results = []
-#     for _ in range(hvd.size()):
-#         bytes_list, shift = _decode(out_buffer, enc_byte)
-#         out_buffer = out_buffer[shift:]
-#         result = pickle.loads(bytes_list)
-#         results.append(result)
-#     return results
+    enc_size = len(enc)
+    max_size = hvd.allgather(torch.tensor([enc_size])).max().item()
+    in_buffer, enc_byte = _encode(enc, max_size)
+
+    out_buffer = hvd.allgather(in_buffer[:enc_byte+enc_size])
+
+    results = []
+    for _ in range(hvd.size()):
+        bytes_list, shift = _decode(out_buffer, enc_byte)
+        out_buffer = out_buffer[shift:]
+        result = pickle.loads(bytes_list)
+        results.append(result)
+    return results

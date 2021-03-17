@@ -16,6 +16,8 @@ import os
 import random
 import numpy as np
 
+import horovod.torch as hvd
+
 import torch
 from torch.nn import parallel
 from fairseq import checkpoint_utils, distributed_utils, options, progress_bar, tasks, utils
@@ -37,6 +39,36 @@ except ImportError:
     HAS_WANDB = False
 
 
+def distributed_init_hvd(args):
+    import warnings
+    import socket
+    import torch.distributed as dist
+    from fairseq.distributed_utils import suppress_output, is_master
+    args.distributed_world_size = -1
+
+    if torch.distributed.is_initialized():
+        warnings.warn('Distributed is already initialized, cannot initialize twice!')
+    else:
+        print('| distributed init (rank {}): {}'.format(
+            args.distributed_rank, args.distributed_init_method), flush=True)
+        dist.init_process_group(
+            backend="mpi",
+            init_method=None,
+            world_size=-1,
+            rank=-1,
+        )
+        print('| initialized host {} as rank {}'.format(
+            socket.gethostname(), args.distributed_rank), flush=True)
+
+        dist.all_reduce(torch.rand(1))
+
+        # suppress_output(is_master(args))
+
+    args.distributed_rank = torch.distributed.get_rank()
+    args.distributed_world_size = hvd.size()
+    print("distributed", args.distributed_rank, args.distributed_world_size)
+    return args.distributed_rank
+
 def main(args, init_distributed=False):
     utils.import_user_module(args)
 
@@ -48,7 +80,7 @@ def main(args, init_distributed=False):
         torch.cuda.set_device(args.device_id)
     torch.manual_seed(args.seed)
     if init_distributed:
-        args.distributed_rank = distributed_utils.distributed_init(args)
+        args.distributed_rank = distributed_init_hvd(args)
 
     # Print args
     print(args)
@@ -86,7 +118,7 @@ def main(args, init_distributed=False):
 
     # Load pre-trained model
     data_token = args.data[0].split("/")[-1]
-    if "bert" in args.arch and "ende" in data_token:
+    if "bert" in args.arch:
         pretrained_path = "{}/train/pretrained_models/maskPredict_{}/checkpoint_best.pt".format(DATASET_PATH, data_token.split(".")[-1].replace("-", "_"))
         if not HAS_NSML:
             pretrained_path = pretrained_path.replace("/train", "")
@@ -115,7 +147,7 @@ def main(args, init_distributed=False):
             nsml.bind(save=save, load=load)
         nsml_bind(model)
 
-    if args.load and args.load.startswith("nsml://"):
+    if args.load:
         print("loading model from session", args.load)
         if args.load.startswith("nsml://"):
             session = args.load.replace("nsml://", "")
@@ -152,28 +184,6 @@ def main(args, init_distributed=False):
                 print("loaded")
             nsml.load(checkpoint_name, load_fn=load, session=session)
 
-    elif args.load:
-        print("loading model from", args.load)
-        state_dict = None
-        dir_path = os.path.dirname(args.load)
-        fn = os.path.basename(args.load)
-        if "-" in fn:
-            start, end = fn.replace("epoch", "").replace(".pt", "").split("-")
-            checkpoint_fns = ["epoch{}.pt".format(i) for i in range(int(start), int(end) + 1)]
-        else:
-            checkpoint_fns = [fn]
-        for fn in checkpoint_fns:
-            state = torch.load(os.path.join(dir_path, fn))
-            model_state = state["model"]
-            for k in model_state:
-                model_state[k] = model_state[k] / float(len(checkpoint_fns))
-            if state_dict is None:
-                state_dict = model_state
-            else:
-                for k in state_dict:
-                    state_dict[k] += model_state[k]
-            print("checkpoint loaded")
-        model.load_state_dict(state_dict)
     # Prepare for decoder wise training
     if args.decoder_wise_training:
         print("| Decoder wise training, start refinement step 0")
@@ -224,18 +234,15 @@ def main(args, init_distributed=False):
 
         # save checkpoint
         if epoch_itr.epoch % args.save_interval == 0:
-            if getattr(args, "save_path", False) and len(args.save_path) > 0 and distributed_utils.is_master(args):
-                if not os.path.exists(args.save_path):
-                    os.mkdir(args.save_path)
-                torch.save({"model": trainer.get_model().state_dict()}, "{}/epoch{}.pt".format(args.save_path, epoch_itr.epoch))
-            elif HAS_NSML:
+            if HAS_NSML:
                 if distributed_utils.is_master(args):
                     print("nsml save for epoch", epoch_itr.epoch)
                     nsml.save("epoch{}".format(epoch_itr.epoch))
-            elif HAS_WANDB and distributed_utils.is_master(args):
+            else:
                 torch.save({"model": trainer.get_model().state_dict()}, "/tmp/epoch{}.pt".format(epoch_itr.epoch))
-                wandb.save("/tmp/epoch{}.pt".format(epoch_itr.epoch))
-                checkpoint_utils.save_checkpoint(args, trainer, epoch_itr, valid_losses[0])
+                if HAS_WANDB:
+                    wandb.save("/tmp/epoch{}.pt".format(epoch_itr.epoch))
+                # checkpoint_utils.save_checkpoint(args, trainer, epoch_itr, valid_losses[0])
 
         if ':' in getattr(args, 'data', ''):
             # sharded data: get train iterator for next epoch
@@ -313,16 +320,12 @@ def train(args, trainer, task, epoch_itr, force_refine_step=None):
                 if distributed_utils.is_master(args):
                     print("saving checkpoint ...")
                     sys.stdout.flush()
-                    if getattr(args, "save_path", False) and len(args.save_path) > 0:
-                        if not os.path.exists(args.save_path):
-                            os.mkdir(args.save_path)
-                        torch.save({"model": trainer.get_model().state_dict()}, "{}/best.pt".format(args.save_path))
-                    elif HAS_NSML:
+                    if HAS_NSML:
                         nsml.save("best")
                     else:
                         torch.save({"model": trainer.get_model().state_dict()}, "/tmp/best.pt")
-                        if HAS_WANDB:
-                            wandb.save("/tmp/best.pt")
+                    if HAS_WANDB:
+                        wandb.save("/tmp/best.pt")
                     sys.stdout.flush()
                 checkpoint_utils.save_checkpoint.best = valid_losses[0]
 
@@ -390,31 +393,6 @@ def get_training_stats(trainer):
     stats['train_wall'] = trainer.get_meter('train_wall')
     return stats
 
-def set_valid_tokens(task, dataset, trainer, args):
-    if getattr(args, "valid_tokens_check", False):
-        return
-    for i in range(300, 500):
-        itr = task.get_batch_iterator(
-            dataset=dataset,
-            max_tokens=i,
-            max_sentences=args.max_sentences_valid,
-            max_positions=utils.resolve_max_positions(
-                task.max_positions(),
-                trainer.get_model().max_positions(),
-            ),
-            ignore_invalid_inputs=args.skip_invalid_size_inputs_valid_test,
-            required_batch_size_multiple=args.required_batch_size_multiple,
-            seed=args.seed,
-            num_workers=args.num_workers,
-        ).next_epoch_itr(shuffle=False)
-        ls = len([d for d in itr])
-        if ls % args.distributed_world_size == 0:
-            args.max_tokens_valid = i
-            setattr(args, "valid_tokens_check", True)
-            if distributed_utils.is_master(args):
-                print("| set valid tokens to", i)
-                sys.stdout.flush()
-            break
 
 def validate(args, trainer, task, epoch_itr, subsets, force_refine_step=None):
     """Evaluate the model on the validation set(s) and return the losses."""
@@ -433,7 +411,6 @@ def validate(args, trainer, task, epoch_itr, subsets, force_refine_step=None):
         else:
             random_bak = None
         dataset.random = valid_random
-        set_valid_tokens(task, dataset, trainer, args)
         itr = task.get_batch_iterator(
             dataset=dataset,
             max_tokens=args.max_tokens_valid,
@@ -449,7 +426,6 @@ def validate(args, trainer, task, epoch_itr, subsets, force_refine_step=None):
             shard_id=args.distributed_rank,
             num_workers=args.num_workers,
         ).next_epoch_itr(shuffle=False)
-
         progress = progress_bar.build_progress_bar(
             args, itr, epoch_itr.epoch,
             prefix='valid on \'{}\' subset'.format(subset),
@@ -529,9 +505,11 @@ def cli_main():
     parser.add_argument("--load", default="", type=str)
     parser.add_argument("--focus", default=-1, type=int)
     parser.add_argument("--masking", action="store_true")
-    parser.add_argument("--save-path", default="", type=str)
     parser.add_argument("--train-decoder-only", action="store_true")
+    parser.add_argument("--hvd", action="store_true")
     args = options.parse_args_and_arch(parser)
+
+    assert args.hvd
 
     if getattr(args, "pnet", False) and args.load == "":
         print("training pnet requires loading a pretrained model")
@@ -540,31 +518,11 @@ def cli_main():
     if args.distributed_init_method is None:
         distributed_utils.infer_init_method(args)
 
-    if args.distributed_init_method is not None:
         # distributed training
-        if torch.cuda.device_count() > 1 and not args.distributed_no_spawn:
-            start_rank = args.distributed_rank
-            args.distributed_rank = None  # assign automatically
-            torch.multiprocessing.spawn(
-                fn=distributed_main,
-                args=(args, start_rank),
-                nprocs=torch.cuda.device_count(),
-            )
-        else:
-            distributed_main(args.device_id, args)
-    elif args.distributed_world_size > 1:
-        # fallback for single node with multiple GPUs
-        assert args.distributed_world_size <= torch.cuda.device_count()
-        port = random.randint(10000, 20000)
-        args.distributed_init_method = 'tcp://localhost:{port}'.format(port=port)
-        args.distributed_rank = None  # set based on device id
-        if max(args.update_freq) > 1 and args.ddp_backend != 'no_c10d':
-            print('| NOTE: you may get better performance with: --ddp-backend=no_c10d')
-        torch.multiprocessing.spawn(
-            fn=distributed_main,
-            args=(args, ),
-            nprocs=args.distributed_world_size,
-        )
+    if args.hvd:
+        hvd.init()
+        args.distributed_rank = hvd.rank()
+        main(args, init_distributed=True)
     else:
         # single GPU training
         main(args)

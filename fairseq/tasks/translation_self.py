@@ -128,17 +128,33 @@ class TranslationSelfTask(FairseqTask):
                 # infer langcode
                 src, tgt = self.args.source_lang, self.args.target_lang
                 if split_exists(split_k, src, tgt, src, data_path):
-                    prefix = os.path.join(data_path, '{}.{}-{}.'.format(split_k, src, tgt))
+                    src_prefix = os.path.join(data_path, '{}.{}-{}.'.format(split_k, src, tgt))
                 elif split_exists(split_k, tgt, src, src, data_path):
-                    prefix = os.path.join(data_path, '{}.{}-{}.'.format(split_k, tgt, src))
+                    src_prefix = os.path.join(data_path, '{}.{}-{}.'.format(split_k, tgt, src))
+                elif split_exists(split_k, src, tgt.split("_")[0], src, data_path):
+                    src_prefix = os.path.join(data_path, '{}.{}-{}.'.format(split_k, src, tgt.split("_")[0]))
                 else:
-                    if k > 0 or dk > 0:
+                    if k > 0:
                         break
                     else:
                         raise FileNotFoundError('Dataset not found: {} ({})'.format(split, data_path))
 
-                src_datasets.append(indexed_dataset(prefix + src, self.src_dict))
-                tgt_datasets.append(indexed_dataset(prefix + tgt, self.tgt_dict))
+                src_datasets.append(
+                    data_utils.load_indexed_dataset(src_prefix + src, self.src_dict)
+                )
+
+                if split_exists(split_k, src, tgt, tgt, data_path):
+                    tgt_prefix = os.path.join(data_path, '{}.{}-{}.'.format(split_k, src, tgt))
+                elif split_exists(split_k, src, tgt.split("_")[0], tgt, data_path):
+                    tgt_prefix = os.path.join(data_path, '{}.{}-{}.'.format(split_k, src, tgt.split("_")[0]))
+                else:
+                    if k > 0:
+                        break
+                    else:
+                        raise FileNotFoundError('Dataset not found: {} ({})'.format(split, data_path))
+                tgt_datasets.append(
+                    data_utils.load_indexed_dataset(tgt_prefix + tgt, self.tgt_dict)
+                )
 
                 print('| {} {} {} examples'.format(data_path, split_k, len(src_datasets[-1])))
 

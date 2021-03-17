@@ -180,7 +180,8 @@ def main(args):
                 outprefix = 'test{}'.format(k) if k > 0 else 'test'
                 make_dataset(testpref, outprefix, lang)
 
-    make_all(args.source_lang)
+    if not args.skip_source:
+        make_all(args.source_lang)
     if target:
         make_all(args.target_lang)
 
@@ -250,5 +251,6 @@ def dataset_dest_file(args, output_prefix, lang, extension):
 
 if __name__ == '__main__':
     parser = get_parser()
+    parser.add_argument("--skip-source", action="store_true")
     args = parser.parse_args()
     main(args)

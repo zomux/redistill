@@ -22,6 +22,11 @@ from fairseq import checkpoint_utils, distributed_utils, models, optim, utils
 from fairseq.meters import AverageMeter, StopwatchMeter, TimeMeter
 from fairseq.optim import lr_scheduler
 
+try:
+    import horovod.torch as hvd
+    import fairseq.distributed_utils_hvd as distributed_utils
+except ImportError:
+    import fairseq.distributed_utils
 
 class Trainer(object):
     """Main class for data parallel training.
@@ -80,7 +85,9 @@ class Trainer(object):
     @property
     def model(self):
         if self._wrapped_model is None:
-            if self.args.distributed_world_size > 1 and not self.args.use_bmuf:
+            if getattr(self.args, "hvd", False):
+                self._wrapped_model = self._model
+            elif self.args.distributed_world_size > 1 and not self.args.use_bmuf:
                 self._wrapped_model = models.DistributedFairseqModel(
                     self.args, self._model,
                 )
@@ -92,6 +99,10 @@ class Trainer(object):
     def optimizer(self):
         if self._optimizer is None:
             self._build_optimizer()
+            if getattr(self.args, "hvd", False):
+                import horovod.torch as hvd
+                self._optimizer = hvd.DistributedOptimizer(self._optimizer, named_parameters=self._model.named_parameters())
+                hvd.broadcast_parameters(self._model.state_dict(), root_rank=0)
         return self._optimizer
 
     @property
@@ -218,7 +229,7 @@ class Trainer(object):
             epoch=epoch,
         )
 
-    def train_step(self, samples, dummy_batch=False, raise_oom=False):
+    def train_step(self, samples, dummy_batch=False, raise_oom=True):
         """Do forward, backward and parameter update."""
         if self._dummy_batch is None:
             self._dummy_batch = samples[0]

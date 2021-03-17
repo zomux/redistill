@@ -38,9 +38,11 @@ def load_langpair_dataset(
 
         # infer langcode
         if split_exists(split_k, src, tgt, src, data_path):
-            prefix = os.path.join(data_path, '{}.{}-{}.'.format(split_k, src, tgt))
+            src_prefix = os.path.join(data_path, '{}.{}-{}.'.format(split_k, src, tgt))
         elif split_exists(split_k, tgt, src, src, data_path):
-            prefix = os.path.join(data_path, '{}.{}-{}.'.format(split_k, tgt, src))
+            src_prefix = os.path.join(data_path, '{}.{}-{}.'.format(split_k, tgt, src))
+        elif split_exists(split_k, src, tgt.split("_")[0], src, data_path):
+            src_prefix = os.path.join(data_path, '{}.{}-{}.'.format(split_k, src, tgt.split("_")[0]))
         else:
             if k > 0:
                 break
@@ -48,10 +50,20 @@ def load_langpair_dataset(
                 raise FileNotFoundError('Dataset not found: {} ({})'.format(split, data_path))
 
         src_datasets.append(
-            data_utils.load_indexed_dataset(prefix + src, src_dict, dataset_impl)
+            data_utils.load_indexed_dataset(src_prefix + src, src_dict, dataset_impl)
         )
+
+        if split_exists(split_k, src, tgt, tgt, data_path):
+            tgt_prefix = os.path.join(data_path, '{}.{}-{}.'.format(split_k, src, tgt))
+        elif split_exists(split_k, src, tgt.split("_")[0], tgt, data_path):
+            tgt_prefix = os.path.join(data_path, '{}.{}-{}.'.format(split_k, src, tgt.split("_")[0]))
+        else:
+            if k > 0:
+                break
+            else:
+                raise FileNotFoundError('Dataset not found: {} ({})'.format(split, data_path))
         tgt_datasets.append(
-            data_utils.load_indexed_dataset(prefix + tgt, tgt_dict, dataset_impl)
+            data_utils.load_indexed_dataset(tgt_prefix + tgt, tgt_dict, dataset_impl)
         )
 
         print('| {} {} {}-{} {} examples'.format(data_path, split_k, src, tgt, len(src_datasets[-1])))
@@ -179,7 +191,6 @@ class TranslationTask(FairseqTask):
 
         # infer langcode
         src, tgt = self.args.source_lang, self.args.target_lang
-
         self.datasets[split] = load_langpair_dataset(
             data_path, split, src, self.src_dict, tgt, self.tgt_dict,
             combine=combine, dataset_impl=self.args.dataset_impl,

@@ -44,21 +44,22 @@ def main(args):
 
     use_cuda = torch.cuda.is_available() and not args.cpu
 
-    sys.argv = sys.argv[:1]
-    import tensorflow as tf
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-    if gpus:
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-        except RuntimeError as e:
-            print(e)
-    bleurt_scorer = score.BleurtScorer(os.path.join(
-        cached_path(
-            "https://storage.googleapis.com/bleurt-oss/bleurt-base-128.zip",
-            extract_compressed_file=True
-        ), "bleurt-base-128"
-    ))
+    if args.reward == "bleurt" or args.eval_bleurt:
+        sys.argv = sys.argv[:1]
+        import tensorflow as tf
+        gpus = tf.config.experimental.list_physical_devices('GPU')
+        if gpus:
+            try:
+                for gpu in gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+            except RuntimeError as e:
+                print(e)
+        bleurt_scorer = score.BleurtScorer(os.path.join(
+            cached_path(
+                "https://storage.googleapis.com/bleurt-oss/bleurt-base-128.zip",
+                extract_compressed_file=True
+            ), "bleurt-base-128"
+        ))
 
     # Load dataset splits
     task = tasks.setup_task(args)
@@ -74,6 +75,7 @@ def main(args):
     # Load ensemble
     print('| loading model(s) from {}'.format(args.path))
     if args.path.startswith("nsml://"):
+        # NSML
         session = args.path.replace("nsml://", "")
         model = task.build_model(args)
         if ".pt" in session:
@@ -108,6 +110,30 @@ def main(args):
                 model.load_state_dict(state_dict)
                 print("loaded")
             nsml.load(checkpoint_name, load_fn=load, session=session)
+        models = [model.cuda()]
+    elif "-" in args.path:
+        model = task.build_model(args)
+        print("loading model from", args.path)
+        state_dict = None
+        dir_path = os.path.dirname(args.path)
+        fn = os.path.basename(args.path)
+        if "-" in fn:
+            start, end = fn.replace("epoch", "").replace(".pt", "").split("-")
+            checkpoint_fns = ["epoch{}.pt".format(i) for i in range(int(start), int(end) + 1)]
+        else:
+            checkpoint_fns = [fn]
+        for fn in checkpoint_fns:
+            state = torch.load(os.path.join(dir_path, fn))
+            model_state = state["model"]
+            for k in model_state:
+                model_state[k] = model_state[k] / float(len(checkpoint_fns))
+            if state_dict is None:
+                state_dict = model_state
+            else:
+                for k in state_dict:
+                    state_dict[k] += model_state[k]
+            print("checkpoint loaded")
+        model.load_state_dict(state_dict)
         models = [model.cuda()]
     else:
         models, _model_args = checkpoint_utils.load_model_ensemble(
@@ -161,6 +187,8 @@ def main(args):
     has_target = True
     results = []
     best_rank_list = []
+    if args.save_path:
+        outf = open(args.save_path, "w")
     with progress_bar.build_progress_bar(args, itr) as t:
         wps_meter = TimeMeter()
         for sample in t:
@@ -177,6 +205,7 @@ def main(args):
             num_generated_tokens = sum(len(h[0]['tokens']) for h in hypos)
             gen_timer.stop(num_generated_tokens)
 
+            hypo_target_pairs = []
             for i, sample_id in enumerate(sample['id'].tolist()):
                 has_target = sample['target'] is not None
 
@@ -205,6 +234,7 @@ def main(args):
                         print('T-{}\t{}'.format(sample_id, target_str))
 
                 if args.reward_sample or args.reward_check:
+                    # Get sample
                     hypo_strs = []
                     rewards = []
                     for j, hypo in enumerate(hypos[i]):
@@ -216,15 +246,33 @@ def main(args):
                             tgt_dict=tgt_dict,
                             remove_bpe=None,
                         )
-                        hypo_str_nobpe = hypo_str.replace("@@ ", "")
-                        rewards.append(compute_reward(hypo_str_nobpe, target_str))
                         hypo_strs.append(hypo_str)
-                    best_idx = np.array(rewards).argmax()
-                    if args.reward_check:
-                        best_rank_list.append(best_idx)
-                    print("{} | {}".format(sample_id, hypo_strs[best_idx]))
-                    sys.stdout.flush()
+                    if args.reward == "sbleu":
+                        for hypo_str in hypo_strs:
+                            hypo_str_nobpe = hypo_str.replace("@@ ", "")
+                            rewards.append(compute_reward(hypo_str_nobpe, target_str))
+                        best_idx = np.array(rewards).argmax()
+                        if args.reward_check:
+                            best_rank_list.append(best_idx)
+                        if args.save_path:
+                            if args.output_all:
+                                for hypo_i in range(len(hypo_strs)):
+                                    outf.write("{} | {:.4f} | {}\n".format(sample_id, rewards[hypo_i], hypo_strs[hypo_i]))
+                            else:
+                                outf.write("{} | {}\n".format(sample_id, hypo_strs[best_idx]))
+                        else:
+                            if args.output_all:
+                                for hypo_i in range(len(hypo_strs)):
+                                    print("{} | {:.4f} | {}".format(sample_id, rewards[hypo_i], hypo_strs[hypo_i]))
+                            else:
+                                print("{} | {}".format(sample_id, hypo_strs[best_idx]))
+                            sys.stdout.flush()
+                    elif args.reward == "bleurt":
+                        hypo_target_pairs.append((
+                            sample_id, target_str, hypo_strs
+                        ))
                 else:
+                    # Normal translation
                     # Process top predictions
                     for j, hypo in enumerate(hypos[i][:args.nbest]):
                         hypo_tokens, hypo_str, alignment = utils.post_process_prediction(
@@ -254,15 +302,43 @@ def main(args):
 
                         # Score only the top hypothesis
                         if has_target and j == 0 and not args.reward_sample:
-                            if align_dict is not None or args.remove_bpe is not None:
+                            # if align_dict is not None or args.remove_bpe is not None:
                                 # Convert back to tokens for evaluation with unk replacement and/or without BPE
-                                target_tokens = tgt_dict.encode_line(target_str, add_if_not_exist=True)
-                            results.append((target_str, hypo_str))
+                                # target_tokens = tgt_dict.encode_line(target_str, add_if_not_exist=True)
+                            # if args.save_path:
+                            #     outf.write("{} | {}\n".format(sample_id, hypo_str))
+                            if j == 0 and not args.no_eval:
+                                results.append((target_str, hypo_str))
                             # if hasattr(scorer, 'add_string'):
                             #     scorer.add_string(target_str, hypo_str)
                             # else:
                             #     scorer.add(target_tokens, hypo_tokens)
-
+            if args.reward_sample and bool(hypo_target_pairs):
+                hypo_batch = []
+                target_batch = []
+                for _, target, hypo_strs in hypo_target_pairs:
+                    hypo_batch.extend([h.replace("@@ ", "") for h in hypo_strs])
+                    target_batch.extend([target_str] * len(hypo_strs))
+                rewards = np.array(bleurt_scorer.score(target_batch, hypo_batch))
+                base_i = 0
+                for sample_id, _, hypo_strs in hypo_target_pairs:
+                    start = base_i
+                    end = base_i + len(hypo_strs)
+                    best_idx = rewards[start:end].argmax()
+                    if args.save_path:
+                        if args.output_all:
+                            for idx in range(start, end):
+                                outf.write("{} | {:.4f} | {}\n".format(sample_id, float(rewards[idx]), hypo_strs[idx - start]))
+                        else:
+                            outf.write("{} | {}\n".format(sample_id, hypo_strs[best_idx]))
+                    else:
+                        if args.output_all:
+                            for idx in range(start, end):
+                                print("{} | {:.4f} | {}".format(sample_id, float(rewards[idx]), hypo_strs[idx - start]))
+                        else:
+                            print("{} | {}".format(sample_id, hypo_strs[best_idx]))
+                        sys.stdout.flush()
+                    base_i += len(hypo_strs)
             wps_meter.update(num_generated_tokens)
             t.log({'wps': round(wps_meter.avg)})
             num_sentences += sample['nsentences']
@@ -273,13 +349,14 @@ def main(args):
     if args.reward_check:
         print("avg ranking of the best sample:", np.array(best_rank_list).mean())
         print("ratio of best sample ranked in the top:", (np.array(best_rank_list) == 0).mean())
-    if has_target and not args.reward_sample and not args.reward_check:
+    if has_target and not args.reward_sample and not args.reward_check and not args.no_eval:
         ref, out = zip(*results)
         from fairseq.criterions.lib_sbleu import smoothed_bleu
         sbleu = np.mean([smoothed_bleu(p[0].split(), p[1].split()) for p in results])
         print("| SBLEU = {:.2f}".format(sbleu))
-        bleurt_scores = bleurt_scorer.score([p[0] for p in results], [p[1] for p in results])
-        print("| BLEURT = {:.4f}".format(np.mean((np.array(bleurt_scores)))))
+        if args.eval_bleurt:
+            bleurt_scores = bleurt_scorer.score([p[0] for p in results], [p[1] for p in results])
+            print("| BLEURT = {:.4f}".format(np.mean((np.array(bleurt_scores)))))
         print('| Generate {} with beam={}: {}'.format(args.gen_subset, args.beam, scorer.score(ref, out)))
     return scorer
 
@@ -290,6 +367,10 @@ def cli_main():
     parser.add_argument("--reward-sample", action="store_true")
     parser.add_argument("--reward", default="sbleu")
     parser.add_argument("--reward-check", action="store_true")
+    parser.add_argument("--output-all", action="store_true")
+    parser.add_argument("--eval-bleurt", action="store_true")
+    parser.add_argument("--no-eval", action="store_true")
+    parser.add_argument("--save-path", type=str, default="")
     args = options.parse_args_and_arch(parser)
     main(args)
 

@@ -54,172 +54,172 @@ class BertLayerNorm(nn.Module):
         x = (x - u) / torch.sqrt(s + self.variance_epsilon)
         return self.gamma * x + self.beta
 
-# @register_model('bert_transformer_seq2seq')
-# class Transformer_nonautoregressive(FairseqModel):
-#     def __init__(self, encoder, decoder):
-#         super().__init__(encoder, decoder)
-#         self.apply(self.init_bert_weights)
-#
-#     def init_bert_weights(self, module):
-#         """ Initialize the weights.
-#         """
-#         if isinstance(module, (nn.Linear, nn.Embedding)):
-#             # Slightly different from the TF version which uses truncated_normal for initialization
-#             # cf https://github.com/pytorch/pytorch/pull/5617
-#             module.weight.data.normal_(mean=0.0, std=0.02)
-#         elif isinstance(module, BertLayerNorm):
-#             module.beta.data.zero_()
-#             module.gamma.data.fill_(1.0)
-#         if isinstance(module, nn.Linear) and module.bias is not None:
-#             module.bias.data.zero_()
-#
-#     @staticmethod
-#     def add_args(parser):
-#         """Add model-specific arguments to the parser."""
-#         parser.add_argument('--dropout', type=float, metavar='D',
-#                             help='dropout probability')
-#         parser.add_argument('--attention-dropout', type=float, metavar='D',
-#                             help='dropout probability for attention weights')
-#         parser.add_argument('--relu-dropout', type=float, metavar='D',
-#                             help='dropout probability after ReLU in FFN')
-#         parser.add_argument('--encoder-embed-path', type=str, metavar='STR',
-#                             help='path to pre-trained encoder embedding')
-#         parser.add_argument('--encoder-embed-dim', type=int, metavar='N',
-#                             help='encoder embedding dimension')
-#         parser.add_argument('--encoder-ffn-embed-dim', type=int, metavar='N',
-#                             help='encoder embedding dimension for FFN')
-#         parser.add_argument('--encoder-layers', type=int, metavar='N',
-#                             help='num encoder layers')
-#         parser.add_argument('--encoder-attention-heads', type=int, metavar='N',
-#                             help='num encoder attention heads')
-#         parser.add_argument('--encoder-normalize-before', action='store_true',
-#                             help='apply layernorm before each encoder block')
-#         parser.add_argument('--encoder-learned-pos', action='store_true',
-#                             help='use learned positional embeddings in the encoder')
-#         parser.add_argument('--decoder-embed-path', type=str, metavar='STR',
-#                             help='path to pre-trained decoder embedding')
-#         parser.add_argument('--decoder-embed-dim', type=int, metavar='N',
-#                             help='decoder embedding dimension')
-#         parser.add_argument('--decoder-ffn-embed-dim', type=int, metavar='N',
-#                             help='decoder embedding dimension for FFN')
-#         parser.add_argument('--decoder-layers', type=int, metavar='N',
-#                             help='num decoder layers')
-#         parser.add_argument('--decoder-attention-heads', type=int, metavar='N',
-#                             help='num decoder attention heads')
-#         parser.add_argument('--decoder-learned-pos', action='store_true',
-#                             help='use learned positional embeddings in the decoder')
-#         parser.add_argument('--decoder-normalize-before', action='store_true',
-#                             help='apply layernorm before each decoder block')
-#         parser.add_argument('--no-enc-token-positional-embeddings', default=False, action='store_true',
-#                             help='if set, disables positional embeddings (outside self attention)')
-#         parser.add_argument('--no-dec-token-positional-embeddings', default=False, action='store_true',
-#                             help='if set, disables positional embeddings (outside self attention)')
-#         parser.add_argument('--embedding-only', default=False, action='store_true',
-#                             help='if set, replaces the encoder with just token embeddings (could be complex e.g. bilm')
-#         parser.add_argument('--share-decoder-input-output-embed', action='store_true',
-#                             help='share decoder input and output embeddings')
-#         parser.add_argument('--share-all-embeddings', action='store_true',
-#                             help='share encoder, decoder and output embeddings'
-#                                  ' (requires shared dictionary and embed dim)')
-#         parser.add_argument('--adaptive-softmax-cutoff', metavar='EXPR',
-#                             help='comma separated list of adaptive softmax cutoff points. '
-#                                  'Must be used with adaptive_loss criterion'),
-#         parser.add_argument('--adaptive-softmax-dropout', type=float, metavar='D',
-#                             help='sets adaptive softmax dropout for the tail projections')
-#         parser.add_argument('--bilm-model-dropout', default=0.1, type=float, metavar='D',
-#                             help='if using a pretrained bilm encoder, what is the model dropout for bilm')
-#         parser.add_argument('--bilm-attention-dropout', default=0.0, type=float, metavar='D',
-#                             help='if using a pretrained bilm encoder, what is the attention dropout for bilm')
-#         parser.add_argument('--bilm-relu-dropout', default=0.0, type=float, metavar='D',
-#                             help='if using a pretrained bilm encoder, what is the relu dropout for bilm')
-#         parser.add_argument('--bilm-mask-last-state', action='store_true',
-#                             help='if set, masks last state in bilm as is done during training')
-#         parser.add_argument('--bilm-add-bos', action='store_true',
-#                             help='if set, adds bos to input')
-#         parser.add_argument('--decoder-embed-scale', type=float,
-#                             help='scaling factor for embeddings used in decoder')
-#         parser.add_argument('--encoder-embed-scale', type=float,
-#                             help='scaling factor for embeddings used in encoder')
-#
-#     @classmethod
-#     def build_model(cls, args, task):
-#         """Build a new model instance."""
-#
-#         #for ds in task.datasets.values():
-#         #    ds.target_is_source = True
-#
-#         # make sure all arguments are present in older models
-#         base_architecture(args)
-#         if not hasattr(args, 'max_source_positions'):
-#             args.max_source_positions = 1024
-#         if not hasattr(args, 'max_target_positions'):
-#             args.max_target_positions = 1024
-#
-#         src_dict, tgt_dict = task.source_dictionary, task.target_dictionary
-#
-#         def build_embedding(dictionary, embed_dim, is_encoder, path=None):
-#
-#             if path is not None:
-#                 if path.startswith('elmo:'):
-#                     lm_path = path[5:]
-#                     task = LanguageModelingTask(args, dictionary, dictionary)
-#                     models, _ = utils.load_ensemble_for_inference([lm_path], task, {'remove_head': True})
-#                     assert len(models) == 1, 'ensembles are currently not supported for elmo embeddings'
-#
-#                     embedder = ElmoTokenEmbedder(models[0], dictionary.eos(), dictionary.pad(), add_bos=is_encoder,
-#                                                  remove_bos=is_encoder, combine_tower_states=is_encoder,
-#                                                  projection_dim=embed_dim, add_final_predictive=is_encoder,
-#                                                  add_final_context=is_encoder)
-#                     return embedder, 1
-#                 elif path.startswith('bilm:'):
-#                     lm_path = path[5:]
-#                     task = LanguageModelingTask(args, dictionary, dictionary)
-#                     models, _ = utils.load_ensemble_for_inference(
-#                         [lm_path],
-#                         task,
-#                         {'remove_head': True,
-#                          'dropout': args.bilm_model_dropout,
-#                          'attention_dropout': args.bilm_attention_dropout,
-#                          'relu_dropout': args.bilm_relu_dropout, })
-#                     assert len(models) == 1, 'ensembles are currently not supported for elmo embeddings'
-#
-#                     return BILMEmbedder(models[0], args, args.encoder_embed_dim) if is_encoder \
-#                         else LMEmbedder(models[0], args.decoder_embed_dim)
-#
-#             num_embeddings = len(dictionary)
-#             padding_idx = dictionary.pad()
-#             emb = nn.Embedding(num_embeddings, embed_dim, padding_idx)
-#             # if provided, load from preloaded dictionaries
-#             if path:
-#                 embed_dict = utils.parse_embedding(path)
-#                 utils.load_embedding(embed_dict, dictionary, emb)
-#             return emb
-#
-#         if args.share_all_embeddings:
-#             if src_dict != tgt_dict:
-#                 raise RuntimeError('--share-all-embeddings requires a joined dictionary')
-#             if args.encoder_embed_dim != args.decoder_embed_dim:
-#                 raise RuntimeError(
-#                     '--share-all-embeddings requires --encoder-embed-dim to match --decoder-embed-dim')
-#             if args.decoder_embed_path and (
-#                     args.decoder_embed_path != args.encoder_embed_path):
-#                 raise RuntimeError('--share-all-embeddings not compatible with --decoder-embed-path')
-#             encoder_embed_tokens = build_embedding(
-#                 src_dict, args.encoder_embed_dim, is_encoder=True, path=args.encoder_embed_path
-#             )
-#             decoder_embed_tokens = encoder_embed_tokens
-#             args.share_decoder_input_output_embed = True
-#         else:
-#             encoder_embed_tokens = build_embedding(
-#                 src_dict, args.encoder_embed_dim, is_encoder=True, path=args.encoder_embed_path
-#             )
-#             decoder_embed_tokens = build_embedding(
-#                 tgt_dict, args.decoder_embed_dim, is_encoder=False, path=args.decoder_embed_path
-#             )
-#
-#         encoder = TransformerEncoder(args, src_dict, encoder_embed_tokens, args.encoder_embed_scale)
-#         decoder = SelfTransformerDecoder(args, tgt_dict, decoder_embed_tokens, args.decoder_embed_scale)
-#         return Transformer_nonautoregressive(encoder, decoder)
+@register_model('cmlm')
+class Transformer_nonautoregressive(FairseqModel):
+    def __init__(self, encoder, decoder):
+        super().__init__(encoder, decoder)
+        self.apply(self.init_bert_weights)
+
+    def init_bert_weights(self, module):
+        """ Initialize the weights.
+        """
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            # Slightly different from the TF version which uses truncated_normal for initialization
+            # cf https://github.com/pytorch/pytorch/pull/5617
+            module.weight.data.normal_(mean=0.0, std=0.02)
+        elif isinstance(module, BertLayerNorm):
+            module.beta.data.zero_()
+            module.gamma.data.fill_(1.0)
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            module.bias.data.zero_()
+
+    @staticmethod
+    def add_args(parser):
+        """Add model-specific arguments to the parser."""
+        parser.add_argument('--dropout', type=float, metavar='D',
+                            help='dropout probability')
+        parser.add_argument('--attention-dropout', type=float, metavar='D',
+                            help='dropout probability for attention weights')
+        parser.add_argument('--relu-dropout', type=float, metavar='D',
+                            help='dropout probability after ReLU in FFN')
+        parser.add_argument('--encoder-embed-path', type=str, metavar='STR',
+                            help='path to pre-trained encoder embedding')
+        parser.add_argument('--encoder-embed-dim', type=int, metavar='N',
+                            help='encoder embedding dimension')
+        parser.add_argument('--encoder-ffn-embed-dim', type=int, metavar='N',
+                            help='encoder embedding dimension for FFN')
+        parser.add_argument('--encoder-layers', type=int, metavar='N',
+                            help='num encoder layers')
+        parser.add_argument('--encoder-attention-heads', type=int, metavar='N',
+                            help='num encoder attention heads')
+        parser.add_argument('--encoder-normalize-before', action='store_true',
+                            help='apply layernorm before each encoder block')
+        parser.add_argument('--encoder-learned-pos', action='store_true',
+                            help='use learned positional embeddings in the encoder')
+        parser.add_argument('--decoder-embed-path', type=str, metavar='STR',
+                            help='path to pre-trained decoder embedding')
+        parser.add_argument('--decoder-embed-dim', type=int, metavar='N',
+                            help='decoder embedding dimension')
+        parser.add_argument('--decoder-ffn-embed-dim', type=int, metavar='N',
+                            help='decoder embedding dimension for FFN')
+        parser.add_argument('--decoder-layers', type=int, metavar='N',
+                            help='num decoder layers')
+        parser.add_argument('--decoder-attention-heads', type=int, metavar='N',
+                            help='num decoder attention heads')
+        parser.add_argument('--decoder-learned-pos', action='store_true',
+                            help='use learned positional embeddings in the decoder')
+        parser.add_argument('--decoder-normalize-before', action='store_true',
+                            help='apply layernorm before each decoder block')
+        parser.add_argument('--no-enc-token-positional-embeddings', default=False, action='store_true',
+                            help='if set, disables positional embeddings (outside self attention)')
+        parser.add_argument('--no-dec-token-positional-embeddings', default=False, action='store_true',
+                            help='if set, disables positional embeddings (outside self attention)')
+        parser.add_argument('--embedding-only', default=False, action='store_true',
+                            help='if set, replaces the encoder with just token embeddings (could be complex e.g. bilm')
+        parser.add_argument('--share-decoder-input-output-embed', action='store_true',
+                            help='share decoder input and output embeddings')
+        parser.add_argument('--share-all-embeddings', action='store_true',
+                            help='share encoder, decoder and output embeddings'
+                                 ' (requires shared dictionary and embed dim)')
+        parser.add_argument('--adaptive-softmax-cutoff', metavar='EXPR',
+                            help='comma separated list of adaptive softmax cutoff points. '
+                                 'Must be used with adaptive_loss criterion'),
+        parser.add_argument('--adaptive-softmax-dropout', type=float, metavar='D',
+                            help='sets adaptive softmax dropout for the tail projections')
+        parser.add_argument('--bilm-model-dropout', default=0.1, type=float, metavar='D',
+                            help='if using a pretrained bilm encoder, what is the model dropout for bilm')
+        parser.add_argument('--bilm-attention-dropout', default=0.0, type=float, metavar='D',
+                            help='if using a pretrained bilm encoder, what is the attention dropout for bilm')
+        parser.add_argument('--bilm-relu-dropout', default=0.0, type=float, metavar='D',
+                            help='if using a pretrained bilm encoder, what is the relu dropout for bilm')
+        parser.add_argument('--bilm-mask-last-state', action='store_true',
+                            help='if set, masks last state in bilm as is done during training')
+        parser.add_argument('--bilm-add-bos', action='store_true',
+                            help='if set, adds bos to input')
+        parser.add_argument('--decoder-embed-scale', type=float,
+                            help='scaling factor for embeddings used in decoder')
+        parser.add_argument('--encoder-embed-scale', type=float,
+                            help='scaling factor for embeddings used in encoder')
+
+    @classmethod
+    def build_model(cls, args, task):
+        """Build a new model instance."""
+
+        #for ds in task.datasets.values():
+        #    ds.target_is_source = True
+
+        # make sure all arguments are present in older models
+        base_architecture(args)
+        if not hasattr(args, 'max_source_positions'):
+            args.max_source_positions = 1024
+        if not hasattr(args, 'max_target_positions'):
+            args.max_target_positions = 1024
+
+        src_dict, tgt_dict = task.source_dictionary, task.target_dictionary
+
+        def build_embedding(dictionary, embed_dim, is_encoder, path=None):
+
+            if path is not None:
+                if path.startswith('elmo:'):
+                    lm_path = path[5:]
+                    task = LanguageModelingTask(args, dictionary, dictionary)
+                    models, _ = utils.load_ensemble_for_inference([lm_path], task, {'remove_head': True})
+                    assert len(models) == 1, 'ensembles are currently not supported for elmo embeddings'
+
+                    embedder = ElmoTokenEmbedder(models[0], dictionary.eos(), dictionary.pad(), add_bos=is_encoder,
+                                                 remove_bos=is_encoder, combine_tower_states=is_encoder,
+                                                 projection_dim=embed_dim, add_final_predictive=is_encoder,
+                                                 add_final_context=is_encoder)
+                    return embedder, 1
+                elif path.startswith('bilm:'):
+                    lm_path = path[5:]
+                    task = LanguageModelingTask(args, dictionary, dictionary)
+                    models, _ = utils.load_ensemble_for_inference(
+                        [lm_path],
+                        task,
+                        {'remove_head': True,
+                         'dropout': args.bilm_model_dropout,
+                         'attention_dropout': args.bilm_attention_dropout,
+                         'relu_dropout': args.bilm_relu_dropout, })
+                    assert len(models) == 1, 'ensembles are currently not supported for elmo embeddings'
+
+                    return BILMEmbedder(models[0], args, args.encoder_embed_dim) if is_encoder \
+                        else LMEmbedder(models[0], args.decoder_embed_dim)
+
+            num_embeddings = len(dictionary)
+            padding_idx = dictionary.pad()
+            emb = nn.Embedding(num_embeddings, embed_dim, padding_idx)
+            # if provided, load from preloaded dictionaries
+            if path:
+                embed_dict = utils.parse_embedding(path)
+                utils.load_embedding(embed_dict, dictionary, emb)
+            return emb
+
+        if args.share_all_embeddings:
+            if src_dict != tgt_dict:
+                raise RuntimeError('--share-all-embeddings requires a joined dictionary')
+            if args.encoder_embed_dim != args.decoder_embed_dim:
+                raise RuntimeError(
+                    '--share-all-embeddings requires --encoder-embed-dim to match --decoder-embed-dim')
+            if args.decoder_embed_path and (
+                    args.decoder_embed_path != args.encoder_embed_path):
+                raise RuntimeError('--share-all-embeddings not compatible with --decoder-embed-path')
+            encoder_embed_tokens = build_embedding(
+                src_dict, args.encoder_embed_dim, is_encoder=True, path=args.encoder_embed_path
+            )
+            decoder_embed_tokens = encoder_embed_tokens
+            args.share_decoder_input_output_embed = True
+        else:
+            encoder_embed_tokens = build_embedding(
+                src_dict, args.encoder_embed_dim, is_encoder=True, path=args.encoder_embed_path
+            )
+            decoder_embed_tokens = build_embedding(
+                tgt_dict, args.decoder_embed_dim, is_encoder=False, path=args.decoder_embed_path
+            )
+
+        encoder = TransformerEncoder(args, src_dict, encoder_embed_tokens, args.encoder_embed_scale)
+        decoder = SelfTransformerDecoder(args, tgt_dict, decoder_embed_tokens, args.decoder_embed_scale)
+        return Transformer_nonautoregressive(encoder, decoder)
 
 
 
@@ -537,37 +537,36 @@ class TransformerEncoder(FairseqEncoder):
                 - **encoder_padding_mask** (ByteTensor): the positions of
                   padding elements of shape `(batch, src_len)`
         """
-        with torch.no_grad():
-            # embed tokens and positions
-            x = self.embed_tokens(src_tokens)
-            #assert (src_tokens.size(1) < self.embed_positions.weights.data.size(0))
-            if self.embed_positions is not None:
-                x = x + self.embed_positions(src_tokens)
-            #len_tokens = self.embed_lengths(src_tokens.ne(self.padding_idx).sum(-1).unsqueeze(-1))   # If enabled, input of len token is src len
-            len_tokens = self.embed_lengths(src_tokens.new(src_tokens.size(0), 1).fill_(0))
-            x = torch.cat([len_tokens, x], dim=1)
-            x = F.dropout(x, p=self.dropout, training=self.training)
+        # embed tokens and positions
+        x = self.embed_tokens(src_tokens)
+        #assert (src_tokens.size(1) < self.embed_positions.weights.data.size(0))
+        if self.embed_positions is not None:
+            x = x + self.embed_positions(src_tokens)
+        #len_tokens = self.embed_lengths(src_tokens.ne(self.padding_idx).sum(-1).unsqueeze(-1))   # If enabled, input of len token is src len
+        len_tokens = self.embed_lengths(src_tokens.new(src_tokens.size(0), 1).fill_(0))
+        x = torch.cat([len_tokens, x], dim=1)
+        x = F.dropout(x, p=self.dropout, training=self.training)
 
-            # B x T x C -> T x B x C
-            x = x.transpose(0, 1)
-            # compute padding mask
-            encoder_padding_mask = src_tokens.eq(self.padding_idx)
-            encoder_padding_mask = torch.cat([encoder_padding_mask.new(src_tokens.size(0), 1).fill_(0), encoder_padding_mask], dim=1)
-            if not encoder_padding_mask.any():
-                encoder_padding_mask = None
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1)
+        # compute padding mask
+        encoder_padding_mask = src_tokens.eq(self.padding_idx)
+        encoder_padding_mask = torch.cat([encoder_padding_mask.new(src_tokens.size(0), 1).fill_(0), encoder_padding_mask], dim=1)
+        if not encoder_padding_mask.any():
+            encoder_padding_mask = None
 
-            # encoder layers
-            for layer in self.layers:
-                x = layer(x, encoder_padding_mask)
-            if self.normalize:
-                x = self.layer_norm(x)
+        # encoder layers
+        for layer in self.layers:
+            x = layer(x, encoder_padding_mask)
+        if self.normalize:
+            x = self.layer_norm(x)
 
-            predicted_lengths_logits = torch.matmul(x[0, :, :], self.embed_lengths.weight.transpose(0, 1)).float()
-            predicted_lengths_logits[:, 0] += float('-inf')   # Cannot predict the len_token
-            predicted_lengths = F.log_softmax(predicted_lengths_logits, dim=-1)
-            x = x[1:, :, :]
-            if encoder_padding_mask is not None:
-                encoder_padding_mask = encoder_padding_mask[:, 1:]
+        predicted_lengths_logits = torch.matmul(x[0, :, :], self.embed_lengths.weight.transpose(0, 1)).float()
+        predicted_lengths_logits[:, 0] += float('-inf')   # Cannot predict the len_token
+        predicted_lengths = F.log_softmax(predicted_lengths_logits, dim=-1)
+        x = x[1:, :, :]
+        if encoder_padding_mask is not None:
+            encoder_padding_mask = encoder_padding_mask[:, 1:]
 
         return {
             'encoder_out': x,  # T x B x C
@@ -672,3 +671,49 @@ class TransformerEncoderLayer(nn.Module):
             return x
 
 
+
+
+@register_model_architecture('cmlm', 'cmlm')
+def base_architecture(args):
+    args.encoder_embed_path = getattr(args, 'encoder_embed_path', None)
+    args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 512)
+    args.encoder_ffn_embed_dim = getattr(args, 'encoder_ffn_embed_dim', args.encoder_embed_dim * 4)
+    args.encoder_layers = getattr(args, 'encoder_layers', 6)
+    args.encoder_attention_heads = getattr(args, 'encoder_attention_heads', args.encoder_embed_dim // 64)
+    args.encoder_normalize_before = getattr(args, 'encoder_normalize_before', False)
+    args.encoder_learned_pos = getattr(args, 'encoder_learned_pos', False)
+    args.decoder_embed_path = getattr(args, 'decoder_embed_path', None)
+    args.decoder_embed_dim = getattr(args, 'decoder_embed_dim', args.encoder_embed_dim)
+    args.decoder_ffn_embed_dim = getattr(args, 'decoder_ffn_embed_dim', args.encoder_ffn_embed_dim)
+    args.decoder_layers = getattr(args, 'decoder_layers', 6)
+    args.decoder_attention_heads = getattr(args, 'decoder_attention_heads', args.encoder_attention_heads)
+    args.decoder_normalize_before = getattr(args, 'decoder_normalize_before', False)
+    args.decoder_learned_pos = getattr(args, 'decoder_learned_pos', False)
+    args.attention_dropout = getattr(args, 'attention_dropout', 0.)
+    args.relu_dropout = getattr(args, 'relu_dropout', 0.)
+    args.dropout = getattr(args, 'dropout', 0.1)
+    args.adaptive_softmax_cutoff = getattr(args, 'adaptive_softmax_cutoff', None)
+    args.adaptive_softmax_dropout = getattr(args, 'adaptive_softmax_dropout', 0)
+    args.share_decoder_input_output_embed = getattr(args, 'share_decoder_input_output_embed', False)
+    args.share_all_embeddings = getattr(args, 'share_all_embeddings', False)
+    args.no_enc_token_positional_embeddings = getattr(args, 'no_enc_token_positional_embeddings', False)
+    args.no_dec_token_positional_embeddings = getattr(args, 'no_dec_token_positional_embeddings', False)
+    args.embedding_only = getattr(args, 'embedding_only', False)
+
+    args.decoder_output_dim = getattr(args, 'decoder_output_dim', args.decoder_embed_dim)
+    args.decoder_input_dim = getattr(args, 'decoder_input_dim', args.decoder_embed_dim)
+
+    args.decoder_embed_scale = getattr(args, 'decoder_embed_scale', None)
+    args.encoder_embed_scale = getattr(args, 'encoder_embed_scale', None)
+
+    args.bilm_mask_last_state = getattr(args, 'bilm_mask_last_state', False)
+    args.bilm_add_bos = getattr(args, 'bilm_add_bos', False)
+
+
+
+@register_model_architecture('cmlm', 'cmlm_big')
+def bi_transformer_lm_big(args):
+    args.decoder_embed_dim = getattr(args, 'decoder_embed_dim', 1024)
+    args.decoder_ffn_embed_dim = getattr(args, 'decoder_ffn_embed_dim', 4096)
+    args.decoder_attention_heads = getattr(args, 'decoder_attention_heads', 16)
+    base_architecture(args)

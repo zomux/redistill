@@ -18,9 +18,10 @@ import re
 
 from fairseq import pybleu, options, progress_bar, tasks, tokenizer, utils, strategies
 from fairseq.meters import TimeMeter
+from fairseq.data import IndexedCachedDataset
+from fairseq.criterions.lib_sbleu import smoothed_bleu
 from fairseq.strategies.strategy_utils import duplicate_encoder_out
 from bleurt import score
-from transformers import cached_path
 
 PRETRAINED_PATH = ""
 
@@ -44,21 +45,6 @@ def main(args, checkpoint_name="best"):
     print('| {} {} {} examples'.format(args.data, args.gen_subset, len(task.dataset(args.gen_subset))))
     args.taskobj = task
 
-    sys.argv = sys.argv[:1]
-    import tensorflow as tf
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-    if gpus:
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-        except RuntimeError as e:
-            print(e)
-    bleurt_scorer = score.BleurtScorer(os.path.join(
-        cached_path(
-            "https://storage.googleapis.com/bleurt-oss/bleurt-base-128.zip",
-            extract_compressed_file=True
-        ), "bleurt-base-128"
-    ))
     # Set dictionaries
     #src_dict = task.source_dictionary
     tgt_dict = task.target_dictionary
@@ -112,6 +98,11 @@ def main(args, checkpoint_name="best"):
         models, _ = utils.load_ensemble_for_inference(args.path.split(':'), task, model_arg_overrides=eval(args.model_overrides))
         models = [model.cuda() for model in models]
 
+    original_target_dataset = None
+    assert args.original_target
+    if args.original_target:
+        original_target_dataset = IndexedCachedDataset(args.original_target, fix_lua_indexing=True)
+
     # Optimize ensemble for generation
     for model in models:
         model.make_generation_fast_(
@@ -145,69 +136,31 @@ def main(args, checkpoint_name="best"):
     num_sentences = 0
     has_target = True
     timer = TimeMeter()
+    rel_reward_log = []
 
     with progress_bar.build_progress_bar(args, itr) as t:
 
         translations = generate_batched_itr(t, strategy, models, tgt_dict, length_beam_size=args.length_beam, use_gold_target_len=args.gold_target_len)
-        for sample_id, src_tokens, target_tokens, hypos in translations:
+        for sample_id, src_tokens, target_tokens, hypos, logp in translations:
+
             has_target = target_tokens is not None
             target_tokens = target_tokens.int().cpu() if has_target else None
 
             # Either retrieve the original sentences or regenerate them from tokens.
-            if align_dict is not None:
-                src_str = task.dataset(args.gen_subset).src.get_original_text(sample_id)
-                target_str = task.dataset(args.gen_subset).tgt.get_original_text(sample_id)
-            else:
-                src_str = dict.string(src_tokens, args.remove_bpe)
-                if args.dehyphenate:
-                    src_str = dehyphenate(src_str)
-                if has_target:
-                    target_str = dict.string(target_tokens, args.remove_bpe, escape_unk=True)
-                    if args.dehyphenate:
-                        target_str = dehyphenate(target_str)
+            distill_str = dict.string(target_tokens, args.remove_bpe, escape_unk=True)
+            hypo_str = dict.string(hypos, args.remove_bpe, escape_unk=True)
+            hypo_str_bpe = dict.string(hypos, None, escape_unk=True)
 
-            if not args.quiet or True:
-                # print('S-{}\t{}'.format(sample_id, src_str))
-                if has_target:
-                    # print('T-{}\t{}'.format(sample_id, target_str))
-                    hypo_tokens, hypo_str, alignment = utils.post_process_prediction(
-                        hypo_tokens=hypos.int().cpu(),
-                        src_str=src_str,
-                        alignment= None,
-                        align_dict=align_dict,
-                        tgt_dict=dict,
-                        remove_bpe=args.remove_bpe,
-                    )
-                    if args.dehyphenate:
-                        hypo_str = dehyphenate(hypo_str)
+            # Compute reward
+            original_target_dataset.prefetch([sample_id])
+            orig_target = dict.string(original_target_dataset[sample_id], args.remove_bpe, escape_unk=True)
+            hypo_reward = smoothed_bleu(hypo_str.split(), orig_target.split())
+            distill_reward = smoothed_bleu(distill_str.split(), orig_target.split())
+            rel_reward = hypo_reward - distill_reward
+            rel_reward_log.append(rel_reward)
 
-                    if not args.quiet:
-                        print('H-{}\t{}'.format(sample_id, hypo_str))
-                        if args.print_alignment:
-                            print('A-{}\t{}'.format(
-                                sample_id,
-                                ' '.join(map(lambda x: str(utils.item(x)), alignment))
-                            ))
-                        # print()
-                        
-                        # Score only the top hypothesis
-                        if has_target:
-                            if align_dict is not None or args.remove_bpe is not None:
-                                # Convert back to tokens for evaluation with unk replacement and/or without BPE
-                                target_tokens = tgt_dict.encode_line(target_str, add_if_not_exist=True)
-
-                    results.append((target_str, hypo_str))
-                    num_sentences += 1
-        if has_target:
-            print('Time = {}'.format(timer.elapsed_time))
-            ref, out = zip(*results)
-            from fairseq.criterions.lib_sbleu import smoothed_bleu
-            sbleu = np.mean([smoothed_bleu(p[0].split(), p[1].split()) for p in results])
-            print("| SBLEU = {:.2f}".format(sbleu))
-            bleurt_scores = bleurt_scorer.score([p[0] for p in results], [p[1] for p in results])
-            print("| BLEURT = {:.4f}".format(np.mean((np.array(bleurt_scores)))))
-            print('| Generate {} with beam={}: BLEU4 = {:2.2f}, '.format(args.gen_subset, args.length_beam, scorer.score(ref, out)))
-
+            print("{} | {:.4f} | {:.4f} | {}".format(sample_id, rel_reward, logp, hypo_str_bpe))
+    print("mean rel reward:", np.mean(rel_reward_log))
 
 def dehyphenate(sent):
     return re.sub(r'(\S)-(\S)', r'\1 ##AT##-##AT## \2', sent).replace('##AT##', '@')
@@ -232,47 +185,46 @@ def generate_batched_itr(data_itr, strategy, models, tgt_dict, length_beam_size=
             k: v for k, v in input.items()
             if k != 'prev_output_tokens'
         }
-        
+
         with torch.no_grad():
             gold_target_len = s['target'].ne(tgt_dict.pad()).sum(-1) if use_gold_target_len else None
-            hypos = generate(strategy, encoder_input, models, tgt_dict, length_beam_size, gold_target_len)
+            hypos, seq_logp = generate(strategy, encoder_input, models, tgt_dict, length_beam_size, gold_target_len, target_seq=sample["target"])
             for batch in range(hypos.size(0)):
                 src = utils.strip_pad(input['src_tokens'][batch].data, tgt_dict.pad())
                 ref = utils.strip_pad(s['target'][batch].data, tgt_dict.pad()) if s['target'] is not None else None
                 hypo = utils.strip_pad(hypos[batch], tgt_dict.pad())
                 example_id = s['id'][batch].data
-                yield example_id, src, ref, hypo
+                yield example_id, src, ref, hypo, seq_logp[batch].data
 
 
-def generate(strategy, encoder_input, models, tgt_dict, length_beam_size, gold_target_len):
+def generate(strategy, encoder_input, models, tgt_dict, length_beam_size, gold_target_len, target_seq=None):
     assert len(models) == 1
     model = models[0]
-    
+
     src_tokens = encoder_input['src_tokens']
     src_tokens = src_tokens.new(src_tokens.tolist())
     bsz = src_tokens.size(0)
     
     encoder_out = model.encoder(**encoder_input)
-    beam = predict_length_beam(gold_target_len, encoder_out['predicted_lengths'], length_beam_size)
-    
-    max_len = beam.max().item()
-    length_mask = torch.triu(src_tokens.new(max_len, max_len).fill_(1).long(), 1)
-    length_mask = torch.stack([length_mask[beam[batch] - 1] for batch in range(bsz)], dim=0)
-    tgt_tokens = src_tokens.new(bsz, length_beam_size, max_len).fill_(tgt_dict.mask())
-    tgt_tokens = (1 - length_mask) * tgt_tokens + length_mask * tgt_dict.pad()
-    tgt_tokens = tgt_tokens.view(bsz * length_beam_size, max_len)
-    
-    duplicate_encoder_out(encoder_out, bsz, length_beam_size)
-    hypotheses, lprobs = strategy.generate(model, encoder_out, tgt_tokens, tgt_dict)
-    
-    hypotheses = hypotheses.view(bsz, length_beam_size, max_len)
-    lprobs = lprobs.view(bsz, length_beam_size)
-    tgt_lengths = (1 - length_mask).sum(-1)
-    avg_log_prob = lprobs / tgt_lengths.float()
-    best_lengths = avg_log_prob.max(-1)[1]
-    hypotheses = torch.stack([hypotheses[b, l, :] for b, l in enumerate(best_lengths)], dim=0)
 
-    return hypotheses
+    target_seq = target_seq.cuda()
+    pad_mask  = target_seq.eq(1)
+    rand_mask = target_seq.clone().float().fill_(0.5).bernoulli().bool()
+    input_seq = target_seq * rand_mask.logical_not() + target_seq.clone().fill_(4) * rand_mask
+    input_seq = pad_mask * target_seq + pad_mask.logical_not() * input_seq
+
+    logits, _ = model.decoder(input_seq, encoder_out)
+
+    probs = torch.softmax(logits * 2, dim=2)
+    B, T, _ = probs.shape
+    sampled_tokens = probs.view(B*T, -1).multinomial(1).view(B, T)
+    sampled_probs = probs.view(B * T, -1)[torch.arange(B*T), sampled_tokens.flatten()].view(B, T)
+    sampled_logp = torch.log(sampled_probs)
+    sampled_tokens = pad_mask * target_seq + pad_mask.logical_not() * sampled_tokens
+    sampled_tokens = rand_mask * sampled_tokens + rand_mask.logical_not() * target_seq
+    seq_logp = (sampled_logp * rand_mask * pad_mask.logical_not()).sum(1)
+
+    return sampled_tokens, seq_logp
 
 
 def predict_length_beam(gold_target_len, predicted_lengths, length_beam_size):
@@ -294,6 +246,7 @@ if __name__ == '__main__':
     parser.add_argument("--semiat", action="store_true")
     parser.add_argument("--scan-checkpoints", action="store_true")
     parser.add_argument("--checkpoint-name", type=str, default="best")
+    parser.add_argument("--original-target", type=str, default="")
     parser.add_argument("--ensemble", action="store_true")
     parser.add_argument("--end-iteration", default=-1, type=int)
     args = options.parse_args_and_arch(parser)

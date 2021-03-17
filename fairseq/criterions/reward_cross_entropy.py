@@ -45,7 +45,7 @@ class RewardCrossEntropyCriterion(FairseqCriterion):
         super().__init__(args, task)
         self.eps = args.label_smoothing
         from fairseq.sequence_generator import SequenceGenerator
-        self.gen = SequenceGenerator(task.target_dictionary, beam_size=5)
+        self.gen = SequenceGenerator(task.target_dictionary, beam_size=args.beam_size)
 
     @staticmethod
     def add_args(parser):
@@ -53,6 +53,8 @@ class RewardCrossEntropyCriterion(FairseqCriterion):
         # fmt: off
         parser.add_argument('--label-smoothing', default=0., type=float, metavar='D',
                             help='epsilon for label smoothing, 0 means no label smoothing')
+        parser.add_argument('--proxyloss2', action="store_true")
+        parser.add_argument('--beam-size', type=int, default=4)
         # fmt: on
 
     def forward(self, model, sample, reduce=True):
@@ -78,7 +80,7 @@ class RewardCrossEntropyCriterion(FairseqCriterion):
                     "prev_output_tokens": sample["net_input"]["prev_output_tokens"][start:end]
                 }
             }
-            sub_results = [[p["tokens"] for p in results] for results in self.gen.generate([model], sub_sample)]
+            sub_results = [[p["tokens"][:60] for p in results] for results in self.gen.generate([model], sub_sample)]
             gen_results.extend(sub_results)
         targets = sample["target"] * torch.gt(sample["target"], 1)
         rewards = []
@@ -90,38 +92,73 @@ class RewardCrossEntropyCriterion(FairseqCriterion):
         rewards = torch.tensor(rewards)
         best_idx = rewards.argmax(1)
         best_results = [res[idx] for res, idx in zip(gen_results, best_idx)]
-        maxlen = max([len(r) for r in best_results])
-        new_target = targets.new_ones(targets.shape[0], maxlen)
-        for i, seq in enumerate(best_results):
-            new_target[i, :seq.shape[0]] = seq
-        first_col = new_target.new_ones(new_target.shape[0]) * 2
-        sample["net_input"]["prev_output_tokens"] = torch.cat([ first_col[:, None], new_target[:, :-1] ], 1)
+        if not self.args.proxyloss2:
+            maxlen = max([len(r) for r in best_results])
+            new_target = targets.new_ones(targets.shape[0], maxlen)
+            for i, seq in enumerate(best_results):
+                new_target[i, :seq.shape[0]] = seq
+            first_col = new_target.new_ones(new_target.shape[0]) * 2
+            new_decoder_input = torch.cat([ first_col[:, None], new_target[:, :-1] ], 1)
+        else:
+            # argmax_results = [res[0] for res in gen_results]
+            worst_results = [res[idx] for res, idx in zip(gen_results, rewards.argmin(1))]
+            merged_results = best_results + worst_results
+            maxlen = max([len(r) for r in merged_results])
+            new_target = targets.new_ones(len(merged_results), maxlen)
+            for i, seq in enumerate(merged_results):
+                new_target[i, :seq.shape[0]] = seq
+            first_col = new_target.new_ones(new_target.shape[0]) * 2
+            new_decoder_input = torch.cat([ first_col[:, None], new_target[:, :-1] ], 1)
+        sample["net_input"]["prev_output_tokens"] = new_decoder_input
         sample["target"] = new_target
         best_reward = rewards[torch.arange(rewards.shape[0]), best_idx].cuda()
         argmax_reward = rewards[:, 0].cuda()
         if is_training:
             model.train()
         # >>>>
-        net_output = model(**sample['net_input'])
-        loss, nll_loss = self.compute_loss(model, net_output, sample, reduce=reduce)
-        sample_size = sample['target'].size(0) if self.args.sentence_avg else sample['ntokens']
+        if not self.args.proxyloss2:
+            decoder_out = model.forward(sample['net_input']["src_tokens"], sample['net_input']["src_lengths"], new_decoder_input)
+            loss, nll_loss = self.compute_loss(model, decoder_out, sample, reduce=reduce)
+        else:
+            # repeated_encoder_out = {"encoder_out": torch.cat([encoder_out["encoder_out"], encoder_out["encoder_out"]]),
+            #                         "encoder_padding_mask":
+            #                             torch.cat([encoder_out["encoder_padding_mask"], encoder_out["encoder_padding_mask"]])
+            #                             if encoder_out["encoder_padding_mask"] is not None else None
+            #                         }
+            repeated_src_tokens = torch.cat([sample['net_input']["src_tokens"], sample['net_input']["src_tokens"]])
+            repeated_src_lengths = torch.cat([sample['net_input']["src_lengths"], sample['net_input']["src_lengths"]])
+            decoder_out = model.forward(repeated_src_tokens, repeated_src_lengths, new_decoder_input)
+            loss, nll = self.compute_loss(model, decoder_out, {"target": new_target}, reduce=False, return_full_mat=True)
+            token_mask = torch.ne(new_target, self.padding_idx)
+            loss = (loss.view(new_target.shape) * token_mask).sum(1) / token_mask.sum(1)
+            nll = (nll.view(new_target.shape) * token_mask).sum(1) / token_mask.sum(1)
+            loss = (loss[:B] - loss[-B:]) * 10.
+            nll_loss = (nll[:B] - nll[-B:]) * 10.
+            if reduce:
+                loss = loss.sum()
+                nll_loss = nll_loss.sum()
+        sample_size = B if self.args.sentence_avg or self.args.proxyloss2 else sample['ntokens']
         logging_output = {
             'loss': utils.item(loss.data) if reduce else loss.data,
             'nll_loss': utils.item(nll_loss.data) if reduce else nll_loss.data,
             'best_r': utils.item(best_reward.sum().data) if reduce else best_reward.data,
             'argmax_r': utils.item(argmax_reward.sum().data) if reduce else argmax_reward.data,
             'ntokens': sample['ntokens'],
-            'nsentences': sample['target'].size(0),
+            'nsentences': B,
             'sample_size': sample_size,
         }
         return loss, sample_size, logging_output
 
-    def compute_loss(self, model, net_output, sample, reduce=True):
+    def compute_loss(self, model, net_output, sample, reduce=True, return_full_mat=False):
         lprobs = model.get_normalized_probs(net_output, log_probs=True)
         lprobs = lprobs.view(-1, lprobs.size(-1))
         target = model.get_targets(sample, net_output).view(-1, 1)
+        if return_full_mat:
+            ignore_index = None
+        else:
+            ignore_index = self.padding_idx
         loss, nll_loss = label_smoothed_nll_loss(
-            lprobs, target, self.eps, ignore_index=self.padding_idx, reduce=reduce,
+            lprobs, target, self.eps, ignore_index=ignore_index, reduce=reduce,
         )
         return loss, nll_loss
 
