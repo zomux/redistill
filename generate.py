@@ -136,11 +136,11 @@ def main(args):
         model.load_state_dict(state_dict)
         models = [model.cuda()]
     else:
-        models, _model_args = checkpoint_utils.load_model_ensemble(
-            args.path.split(':'),
-            arg_overrides=eval(args.model_overrides),
-            task=task,
-        )
+        model = task.build_model(args)
+        state = torch.load(args.path)
+        model_state = state["model"]
+        model.load_state_dict(model_state)
+        models = [model.cuda()]
 
     # Optimize ensemble for generation
     for model in models:

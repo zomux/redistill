@@ -132,8 +132,9 @@ class RewardCrossEntropyCriterion(FairseqCriterion):
             token_mask = torch.ne(new_target, self.padding_idx)
             loss = (loss.view(new_target.shape) * token_mask).sum(1) / token_mask.sum(1)
             nll = (nll.view(new_target.shape) * token_mask).sum(1) / token_mask.sum(1)
-            loss = (loss[:B] - loss[-B:]) * 10.
+            loss = (loss[:B] - loss[-B:]) * 10. + 0.1
             nll_loss = (nll[:B] - nll[-B:]) * 10.
+            loss = torch.gt(loss, 0) * loss
             if reduce:
                 loss = loss.sum()
                 nll_loss = nll_loss.sum()
