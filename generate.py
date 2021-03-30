@@ -308,7 +308,7 @@ def main(args):
                             # if args.save_path:
                             #     outf.write("{} | {}\n".format(sample_id, hypo_str))
                             if j == 0 and not args.no_eval:
-                                results.append((target_str, hypo_str))
+                                results.append((sample_id, target_str, hypo_str))
                             # if hasattr(scorer, 'add_string'):
                             #     scorer.add_string(target_str, hypo_str)
                             # else:
@@ -345,17 +345,22 @@ def main(args):
 
     print('| Translated {} sentences ({} tokens) in {:.1f}s ({:.2f} sentences/s, {:.2f} tokens/s)'.format(
         num_sentences, gen_timer.n, gen_timer.sum, num_sentences / gen_timer.sum, 1. / gen_timer.avg))
+    if args.save_path and not args.reward_check and not args.reward_sample:
+        results.sort()
+        for _, tgt, hyp in results:
+            outf.write(hyp + "\n")
+        print("results saved to", args.save_path)
 
     if args.reward_check:
         print("avg ranking of the best sample:", np.array(best_rank_list).mean())
         print("ratio of best sample ranked in the top:", (np.array(best_rank_list) == 0).mean())
     if has_target and not args.reward_sample and not args.reward_check and not args.no_eval:
-        ref, out = zip(*results)
+        _, ref, out = zip(*results)
         from fairseq.criterions.lib_sbleu import smoothed_bleu
-        sbleu = np.mean([smoothed_bleu(p[0].split(), p[1].split()) for p in results])
+        sbleu = np.mean([smoothed_bleu(p[1].split(), p[2].split()) for p in results])
         print("| SBLEU = {:.2f}".format(sbleu))
         if args.eval_bleurt:
-            bleurt_scores = bleurt_scorer.score([p[0] for p in results], [p[1] for p in results])
+            bleurt_scores = bleurt_scorer.score([p[1] for p in results], [p[2] for p in results])
             print("| BLEURT = {:.4f}".format(np.mean((np.array(bleurt_scores)))))
         print('| Generate {} with beam={}: {}'.format(args.gen_subset, args.beam, scorer.score(ref, out)))
     return scorer

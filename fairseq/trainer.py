@@ -229,7 +229,7 @@ class Trainer(object):
             epoch=epoch,
         )
 
-    def train_step(self, samples, dummy_batch=False, raise_oom=True):
+    def train_step(self, samples, dummy_batch=False, raise_oom=False):
         """Do forward, backward and parameter update."""
         if self._dummy_batch is None:
             self._dummy_batch = samples[0]
