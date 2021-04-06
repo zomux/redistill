@@ -208,6 +208,7 @@ def main(args):
 
             hypo_target_pairs = []
             for i, sample_id in enumerate(sample['id'].tolist()):
+                total_n += 1
                 has_target = sample['target'] is not None
 
                 # Remove padding
