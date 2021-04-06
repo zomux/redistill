@@ -353,8 +353,8 @@ def main(args):
         num_sentences, gen_timer.n, gen_timer.sum, num_sentences / gen_timer.sum, 1. / gen_timer.avg))
     if args.save_path and not args.reward_check and not args.reward_sample:
         results.sort()
-        for sample_id, tgt, hyp in results:
-            outf.write("{}\t{}\n".format(sample_id, hyp))
+        for sample_id, tgt, hyp, score in results:
+            outf.write("{}\t{}\t{}\n".format(sample_id, score, hyp))
         print("results saved to", args.save_path)
 
     if args.reward_check:
