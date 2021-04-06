@@ -189,6 +189,7 @@ def main(args):
     best_rank_list = []
     if args.save_path:
         outf = open(args.save_path, "w")
+    total_n = 0
     with progress_bar.build_progress_bar(args, itr) as t:
         wps_meter = TimeMeter()
         for sample in t:
