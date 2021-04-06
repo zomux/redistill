@@ -315,7 +315,7 @@ def main(args):
                             #     scorer.add_string(target_str, hypo_str)
                             # else:
                             #     scorer.add(target_tokens, hypo_tokens)
-            if 0 < args.save_amount < total_n:
+            if args.save_amount > 0 and total_n > args.save_amount:
                 break
             if args.reward_sample and bool(hypo_target_pairs):
                 hypo_batch = []
