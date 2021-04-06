@@ -5,6 +5,7 @@
 # the root directory of this source tree. An additional grant of patent rights
 # can be found in the PATENTS file in the same directory.
 
+import os
 import torch
 import numpy as np
 import math
@@ -46,6 +47,35 @@ class RewardCrossEntropyCriterion(FairseqCriterion):
         self.eps = args.label_smoothing
         from fairseq.sequence_generator import SequenceGenerator
         self.gen = SequenceGenerator(task.target_dictionary, beam_size=args.beam_size)
+        if args.reward == "bleurt":
+            from fairseq.distributed_utils import get_rank
+            sys.argv = sys.argv[:1]
+            my_rank = 0 if torch.cuda.device_count() <= 1 else get_rank()
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(my_rank % 4)
+            from bleurt import score
+            from transformers import cached_path
+            import tensorflow as tf
+            gpus = tf.config.experimental.list_physical_devices('GPU')
+            if gpus:
+                this_gpu = gpus[my_rank % 4]
+                tf.config.set_visible_devices([this_gpu], 'GPU')
+                try:
+                    tf.config.experimental.set_memory_growth(this_gpu, True)
+                    tf.config.experimental.set_virtual_device_configuration(
+                        this_gpu,
+                        [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=2048)])
+                    logical_devices = tf.config.list_logical_devices('GPU')
+                    self.logical_device = tf.device(logical_devices[0].name)
+                    print("num of logical gpus", len(logical_devices))
+                except RuntimeError as e:
+                    print(e)
+            with self.logical_device:
+                self.bleurt_scorer = score.BleurtScorer(os.path.join(
+                    cached_path(
+                        "https://storage.googleapis.com/bleurt-oss/bleurt-base-128.zip",
+                        extract_compressed_file=True
+                    ), "bleurt-base-128"
+                ))
 
     @staticmethod
     def add_args(parser):
@@ -54,6 +84,10 @@ class RewardCrossEntropyCriterion(FairseqCriterion):
         parser.add_argument('--label-smoothing', default=0., type=float, metavar='D',
                             help='epsilon for label smoothing, 0 means no label smoothing')
         parser.add_argument('--proxyloss2', action="store_true")
+        parser.add_argument('--bleurt-scale', action="store_true")
+        parser.add_argument('--contrastive', action="store_true")
+        parser.add_argument('--m', default=10, type=float)
+        parser.add_argument('--reward', default="sbleu", type=str)
         parser.add_argument('--beam-size', type=int, default=4)
         # fmt: on
 
@@ -83,14 +117,41 @@ class RewardCrossEntropyCriterion(FairseqCriterion):
             sub_results = [[p["tokens"][:60] for p in results] for results in self.gen.generate([model], sub_sample)]
             gen_results.extend(sub_results)
         targets = sample["target"] * torch.gt(sample["target"], 1)
-        rewards = []
-        for batch_i in range(len(gen_results)):
-            batch_rewards = []
-            for seq in gen_results[batch_i]:
-                batch_rewards.append(self.compute_reward(seq, targets[batch_i]))
-            rewards.append(batch_rewards)
-        rewards = torch.tensor(rewards)
+        if self.args.reward == "sbleu":
+            rewards = []
+            for batch_i in range(len(gen_results)):
+                batch_rewards = []
+                for seq in gen_results[batch_i]:
+                    batch_rewards.append(self.compute_reward(seq, targets[batch_i]))
+                rewards.append(batch_rewards)
+            rewards = torch.tensor(rewards)
+        elif self.args.reward == "bleurt":
+            hyps = []
+            tgts = []
+            for batch_i in range(len(gen_results)):
+                for seq in gen_results[batch_i]:
+                    hyps.append(self.task.tgt_dict.string(seq, bpe_symbol="@@ "))
+                    tgts.append(self.task.tgt_dict.string(targets[batch_i][:torch.gt(targets[batch_i], 0).sum()], bpe_symbol="@@ "))
+            with self.logical_device:
+                scores = torch.tensor(self.bleurt_scorer.score(tgts, hyps))
+                if self.args.bleurt_scale:
+                    rewards = scores * 100.
+                else:
+                    rewards = torch.exp(scores) * 100.
+            rewards = rewards.view(B, -1)
         best_idx = rewards.argmax(1)
+        # idxp = np.random.randint(rewards.shape[1], size=(rewards.shape[0], 2))
+        # idxp_tensor = torch.tensor(idxp)
+        # selected_rewards = torch.cat([
+        #     rewards[torch.arange(rewards.size(0)), idxp_tensor[:, 0]][:, None],
+        #     rewards[torch.arange(rewards.size(0)), idxp_tensor[:, 1]][:, None]
+        # ], 1)
+        # valid_mask = selected_rewards[:, 0] > selected_rewards[:, 1]
+        # reversed_selected_rewards = torch.cat([selected_rewards[:, 1][:, None], selected_rewards[:, 0][:, None]], 1)
+        # selected_rewards = selected_rewards * valid_mask[:, None] + reversed_selected_rewards * valid_mask.logical_not()[:, None]
+        # reversed_idxp_tensor = torch.cat([idxp_tensor[:, 1][:, None], idxp_tensor[:, 0][:, None]], 1)
+        # idxp_tensor = idxp_tensor * valid_mask[:, None] + reversed_idxp_tensor * valid_mask.logical_not()[:, None]
+        # best_results = [res[idx] for res, idx in zip(gen_results, idxp_tensor[:, 0])]
         best_results = [res[idx] for res, idx in zip(gen_results, best_idx)]
         if not self.args.proxyloss2:
             maxlen = max([len(r) for r in best_results])
@@ -101,6 +162,7 @@ class RewardCrossEntropyCriterion(FairseqCriterion):
             new_decoder_input = torch.cat([ first_col[:, None], new_target[:, :-1] ], 1)
         else:
             # argmax_results = [res[0] for res in gen_results]
+            # worst_results = [res[idx] for res, idx in zip(gen_results, idxp_tensor[:, 1])]
             worst_results = [res[idx] for res, idx in zip(gen_results, rewards.argmin(1))]
             merged_results = best_results + worst_results
             maxlen = max([len(r) for r in merged_results])
@@ -112,7 +174,11 @@ class RewardCrossEntropyCriterion(FairseqCriterion):
         sample["net_input"]["prev_output_tokens"] = new_decoder_input
         sample["target"] = new_target
         best_reward = rewards[torch.arange(rewards.shape[0]), best_idx].cuda()
+        worst_reward = rewards[torch.arange(rewards.shape[0]), rewards.argmin(1)].cuda()
+        # best_reward = selected_rewards[:, 0].cuda()
+        # worst_reward = selected_rewards[:, 1].cuda()
         argmax_reward = rewards[:, 0].cuda()
+        mean_reward = rewards.mean(1).cuda()
         if is_training:
             model.train()
         # >>>>
@@ -132,9 +198,13 @@ class RewardCrossEntropyCriterion(FairseqCriterion):
             token_mask = torch.ne(new_target, self.padding_idx)
             loss = (loss.view(new_target.shape) * token_mask).sum(1) / token_mask.sum(1)
             nll = (nll.view(new_target.shape) * token_mask).sum(1) / token_mask.sum(1)
-            loss = (loss[:B] - loss[-B:]) * 10. + 0.1
+            if self.args.contrastive:
+                loss = (loss[:B] - loss[-B:]) * 10.
+            else:
+                loss = (loss[:B] - loss[-B:]) * 10. + self.args.m * ((best_reward - worst_reward) / 100.)
+                loss = torch.gt(loss, 0) * loss
+            # loss = ((best_reward - worst_reward) / 100.) * (loss[:B] - loss[-B:]) * 10.
             nll_loss = (nll[:B] - nll[-B:]) * 10.
-            loss = torch.gt(loss, 0) * loss
             if reduce:
                 loss = loss.sum()
                 nll_loss = nll_loss.sum()
@@ -144,6 +214,7 @@ class RewardCrossEntropyCriterion(FairseqCriterion):
             'nll_loss': utils.item(nll_loss.data) if reduce else nll_loss.data,
             'best_r': utils.item(best_reward.sum().data) if reduce else best_reward.data,
             'argmax_r': utils.item(argmax_reward.sum().data) if reduce else argmax_reward.data,
+            'avg_r': utils.item(mean_reward.sum().data) if reduce else mean_reward.data,
             'ntokens': sample['ntokens'],
             'nsentences': B,
             'sample_size': sample_size,
@@ -156,11 +227,13 @@ class RewardCrossEntropyCriterion(FairseqCriterion):
         target = model.get_targets(sample, net_output).view(-1, 1)
         if return_full_mat:
             ignore_index = None
+            loss = - lprobs.gather(dim=1, index=target).flatten()
+            nll_loss = loss
         else:
             ignore_index = self.padding_idx
-        loss, nll_loss = label_smoothed_nll_loss(
-            lprobs, target, self.eps, ignore_index=ignore_index, reduce=reduce,
-        )
+            loss, nll_loss = label_smoothed_nll_loss(
+                lprobs, target, self.eps, ignore_index=ignore_index, reduce=reduce,
+            )
         return loss, nll_loss
 
     @staticmethod
@@ -174,6 +247,7 @@ class RewardCrossEntropyCriterion(FairseqCriterion):
             'nll_loss': sum(log.get('nll_loss', 0) for log in logging_outputs) / ntokens / math.log(2) if ntokens > 0 else 0.,
             'best_r': sum(log.get('best_r', 0) for log in logging_outputs) / nsentences / math.log(2) if nsentences > 0 else 0.,
             'argmax_r': sum(log.get('argmax_r', 0) for log in logging_outputs) / nsentences / math.log(2) if nsentences > 0 else 0.,
+            'avg_r': sum(log.get('avg_r', 0) for log in logging_outputs) / nsentences / math.log(2) if nsentences > 0 else 0.,
             'ntokens': ntokens,
             'nsentences': nsentences,
             'sample_size': sample_size,

@@ -208,7 +208,7 @@ def main(args, init_distributed=False):
             validate(args, trainer, task, epoch_itr, valid_subsets, force_refine_step=i)
         print("---")
     validate(args, trainer, task, epoch_itr, valid_subsets)
-    while lr > args.min_lr and epoch_itr.epoch < max_epoch and trainer.get_num_updates() < max_update:
+    while lr > args.min_lr and epoch_itr.epoch < max_epoch and trainer.get_num_updates() < max_update and not getattr(args, "early_stopping", False):
         # train for one epoch
         train(args, trainer, task, epoch_itr, force_refine_step=progressive_training_step)
         if not args.disable_validation and epoch_itr.epoch % args.validate_interval == 0:
@@ -272,6 +272,7 @@ def train(args, trainer, task, epoch_itr, force_refine_step=None):
     if hasattr(args, "progressive") and args.progressive:
         task.dataset("train").set_random_refine_step(args.refinetot, force_refine_step=force_refine_step)
     last_samples = None
+    last_best_update = 0
     for i, samples in enumerate(progress, start=epoch_itr.iterations_in_epoch):
         if samples is None or len(samples) == 0:
             sys.stderr.write("Empty sample detected\n")
@@ -310,6 +311,7 @@ def train(args, trainer, task, epoch_itr, force_refine_step=None):
             #     print("saving:", trainer.get_num_updates())
             #     nsml.save(str(trainer.get_num_updates()))
             if not hasattr(checkpoint_utils.save_checkpoint, 'best') or is_better(valid_losses[0], checkpoint_utils.save_checkpoint.best):
+                last_best_update = num_updates
                 if distributed_utils.is_master(args):
                     print("saving checkpoint ...")
                     sys.stdout.flush()
@@ -344,8 +346,13 @@ def train(args, trainer, task, epoch_itr, force_refine_step=None):
             trainer.criterion.pool.clear()
             print("| Start refinement step:", force_refine_step)
 
-
         if num_updates >= max_update:
+            break
+
+        if args.early_stop and num_updates - last_best_update >= 3000:
+            if distributed_utils.is_master(args):
+                    print("early stop")
+            setattr(args, "early_stopping", True)
             break
 
         if hasattr(args, "progressive") and args.progressive:
@@ -466,6 +473,8 @@ def validate(args, trainer, task, epoch_itr, subsets, force_refine_step=None):
         if hasattr(args, "progressive") and args.progressive:
             dataset.set_random_refine_step(args.refinetot, force_refine_step=force_refine_step)
         for sample in progress:
+            if trainer._oom_batch is None:
+                trainer._oom_batch = sample
             if sample is None or len(sample) == 0:
                 sys.stderr.write("empty valid sample detected\n")
                 sys.stderr.flush()
@@ -529,6 +538,7 @@ def cli_main():
     parser.add_argument("--load", default="", type=str)
     parser.add_argument("--focus", default=-1, type=int)
     parser.add_argument("--masking", action="store_true")
+    parser.add_argument("--early-stop", action="store_true")
     parser.add_argument("--save-path", default="", type=str)
     parser.add_argument("--train-decoder-only", action="store_true")
     args = options.parse_args_and_arch(parser)

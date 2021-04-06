@@ -14,7 +14,7 @@ def prepare_debug():
     print("debug at http://{}:1{}".format(addr.split("@")[-1], port))
     sys.stdout.flush()
     subprocess.Popen(
-        'autossh -M 0 -N -R \*:{}:localhost:5555 -i ./data/askey {} -oPort=80 -o "ServerAliveInterval 60" -o "ExitOnForwardFailure yes" -o StrictHostKeyChecking=no'.format(port, addr),
+        'autossh -M 0 -N -R \*:{}:localhost:5555 -i ~/works/cmlm/data/askey {} -oPort=80 -o "ServerAliveInterval 60" -o "ExitOnForwardFailure yes" -o StrictHostKeyChecking=no'.format(port, addr),
         shell=True)
 
 def set_trace():
