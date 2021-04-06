@@ -303,8 +303,7 @@ def main(args):
                                 ))
 
                         # Score only the top hypothesis
-                        import pdb;pdb.set_trace()
-                        results.append((sample_id, target_str, hypo_str, hypo['score']))
+                        results.append((sample_id, target_str, hypo_str, float(hypo["positional_scores"].mean())))
                         if has_target and j == 0 and not args.reward_sample:
                             pass
                             # if align_dict is not None or args.remove_bpe is not None:
