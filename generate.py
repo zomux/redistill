@@ -303,7 +303,7 @@ def main(args):
                                 ))
 
                         # Score only the top hypothesis
-                        results.append((sample_id, target_str, hypo_str))
+                        results.append((sample_id, target_str, hypo_str, hypo['score']))
                         if has_target and j == 0 and not args.reward_sample:
                             pass
                             # if align_dict is not None or args.remove_bpe is not None:
