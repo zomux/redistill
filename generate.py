@@ -361,7 +361,7 @@ def main(args):
         print("avg ranking of the best sample:", np.array(best_rank_list).mean())
         print("ratio of best sample ranked in the top:", (np.array(best_rank_list) == 0).mean())
     if has_target and not args.reward_sample and not args.reward_check and not args.no_eval:
-        _, ref, out = zip(*results)
+        _, ref, out, _ = zip(*results)
         from fairseq.criterions.lib_sbleu import smoothed_bleu
         sbleu = np.mean([smoothed_bleu(p[1].split(), p[2].split()) for p in results])
         print("| SBLEU = {:.2f}".format(sbleu))
