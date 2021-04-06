@@ -309,8 +309,6 @@ def main(args):
                                 # target_tokens = tgt_dict.encode_line(target_str, add_if_not_exist=True)
                             # if args.save_path:
                             #     outf.write("{} | {}\n".format(sample_id, hypo_str))
-                            if j == 0 and not args.no_eval:
-                                results.append((sample_id, target_str, hypo_str))
                             # if hasattr(scorer, 'add_string'):
                             #     scorer.add_string(target_str, hypo_str)
                             # else:
