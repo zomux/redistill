@@ -376,6 +376,7 @@ def cli_main():
     parser.add_argument("--eval-bleurt", action="store_true")
     parser.add_argument("--no-eval", action="store_true")
     parser.add_argument("--save-path", type=str, default="")
+    parser.add_argument("--save-amount", type=int, default=-1)
     args = options.parse_args_and_arch(parser)
     main(args)
 
