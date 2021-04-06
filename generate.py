@@ -303,12 +303,16 @@ def main(args):
                                 ))
 
                         # Score only the top hypothesis
+                        results.append((sample_id, target_str, hypo_str))
                         if has_target and j == 0 and not args.reward_sample:
+                            pass
                             # if align_dict is not None or args.remove_bpe is not None:
                                 # Convert back to tokens for evaluation with unk replacement and/or without BPE
                                 # target_tokens = tgt_dict.encode_line(target_str, add_if_not_exist=True)
                             # if args.save_path:
                             #     outf.write("{} | {}\n".format(sample_id, hypo_str))
+                            # if j == 0 and not args.no_eval:
+                            #     results.append((sample_id, target_str, hypo_str))
                             # if hasattr(scorer, 'add_string'):
                             #     scorer.add_string(target_str, hypo_str)
                             # else:
