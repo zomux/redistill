@@ -400,6 +400,10 @@ def get_training_stats(trainer):
 def set_valid_tokens(task, dataset, trainer, args):
     if getattr(args, "valid_tokens_check", False):
         return
+    if args.distributed_world_size == 1:
+        args.max_tokens_valid = 1024
+        setattr(args, "valid_tokens_check", True)
+        return
     for i in range(300, 500):
         itr = task.get_batch_iterator(
             dataset=dataset,
