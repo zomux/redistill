@@ -17,7 +17,6 @@ import sys
 from fairseq import pybleu, checkpoint_utils, options, progress_bar, tasks, utils
 from fairseq.meters import StopwatchMeter, TimeMeter
 from fairseq.criterions.lib_sbleu import smoothed_bleu
-from bleurt import score
 from transformers import cached_path
 
 try:
