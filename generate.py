@@ -17,6 +17,7 @@ import sys
 from fairseq import pybleu, checkpoint_utils, options, progress_bar, tasks, utils
 from fairseq.meters import StopwatchMeter, TimeMeter
 from fairseq.criterions.lib_sbleu import smoothed_bleu
+from bleurt import score
 from transformers import cached_path
 
 try:
@@ -29,6 +30,7 @@ def compute_reward(hypo_str, target_str):
     return smoothed_bleu(hypo_str.split(), target_str.split())
 
 def main(args):
+    global score
     assert args.path is not None, '--path required for generation!'
     assert not args.sampling or args.nbest == args.beam, \
         '--sampling requires --nbest to be equal to --beam'
