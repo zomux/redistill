@@ -367,7 +367,7 @@ def main(args):
         sbleu = np.mean([smoothed_bleu(p[1].split(), p[2].split()) for p in results])
         print("| SBLEU = {:.2f}".format(sbleu))
         if args.eval_bleurt:
-            bleurt_scores = bleurt_scorer.score([p[1] for p in results], [p[2] for p in results])
+            bleurt_scores = bleurt_scorer.score(references=[p[1] for p in results], [p[2] for p in results])
             print("| BLEURT = {:.4f}".format(np.mean((np.array(bleurt_scores)))))
         print('| Generate {} with beam={}: {}'.format(args.gen_subset, args.beam, scorer.score(ref, out)))
     return scorer
